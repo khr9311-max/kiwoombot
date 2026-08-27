@@ -1,0 +1,124 @@
+# ---
+# api_id: 0F
+# api_name: 주식당일거래원
+# category: 국내주식
+# sub_category: 실시간시세
+# template: websocket_realtime
+# api_url: /api/dostk/websocket
+# menu_path: 국내주식 > 실시간시세 > 주식당일거래원(0F)
+# ---
+
+import asyncio
+import logging
+from typing import Any
+
+from kiwoom import get_ws_client
+from kiwoom.realtime import event_to_dataframe, run_pubsub
+
+# 주식당일거래원(0F) 실시간 구독 — 한 스트림을 여러 소비자에 분배
+# in-process Pub/Sub(asyncio.Queue). LOGIN/PING은 공통 클라이언트가 처리합니다.
+
+API_URL = "/api/dostk/websocket"
+COLUMNS = {
+    '141': '매도거래원1',
+    '161': '매도거래원수량1',
+    '166': '매도거래원별증감1',
+    '146': '매도거래원코드1',
+    '271': '매도거래원색깔1',
+    '151': '매수거래원1',
+    '171': '매수거래원수량1',
+    '176': '매수거래원별증감1',
+    '156': '매수거래원코드1',
+    '281': '매수거래원색깔1',
+    '142': '매도거래원2',
+    '162': '매도거래원수량2',
+    '167': '매도거래원별증감2',
+    '147': '매도거래원코드2',
+    '272': '매도거래원색깔2',
+    '152': '매수거래원2',
+    '172': '매수거래원수량2',
+    '177': '매수거래원별증감2',
+    '157': '매수거래원코드2',
+    '282': '매수거래원색깔2',
+    '143': '매도거래원3',
+    '163': '매도거래원수량3',
+    '168': '매도거래원별증감3',
+    '148': '매도거래원코드3',
+    '273': '매도거래원색깔3',
+    '153': '매수거래원3',
+    '173': '매수거래원수량3',
+    '178': '매수거래원별증감3',
+    '158': '매수거래원코드3',
+    '283': '매수거래원색깔3',
+    '144': '매도거래원4',
+    '164': '매도거래원수량4',
+    '169': '매도거래원별증감4',
+    '149': '매도거래원코드4',
+    '274': '매도거래원색깔4',
+    '154': '매수거래원4',
+    '174': '매수거래원수량4',
+    '179': '매수거래원별증감4',
+    '159': '매수거래원코드4',
+    '284': '매수거래원색깔4',
+    '145': '매도거래원5',
+    '165': '매도거래원수량5',
+    '170': '매도거래원별증감5',
+    '150': '매도거래원코드5',
+    '275': '매도거래원색깔5',
+    '155': '매수거래원5',
+    '175': '매수거래원수량5',
+    '180': '매수거래원별증감5',
+    '160': '매수거래원코드5',
+    '285': '매수거래원색깔5',
+    '261': '외국계매도추정합',
+    '262': '외국계매도추정합변동',
+    '263': '외국계매수추정합',
+    '264': '외국계매수추정합변동',
+    '267': '외국계순매수추정합',
+    '268': '외국계순매수변동',
+    '337': '거래소구분',
+}
+
+
+async def print_dataframe(queue: asyncio.Queue[Any]) -> None:
+    # "kiwoom.realtime" 토픽: REAL 이벤트만 도착 → DataFrame으로 출력
+    while True:
+        event = await queue.get()
+        print(event_to_dataframe(event), flush=True)
+
+
+async def log_raw(queue: asyncio.Queue[Any]) -> None:
+    # "kiwoom.all" 토픽: REG/SYSTEM 포함 모든 메시지를 원본 그대로 출력
+    while True:
+        event = await queue.get()
+        print(event, flush=True)
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+
+    # Kiwoom 실시간 등록 패킷(REG)
+    body = {
+        "trnm": "REG",  # 등록("0"이면 해제)
+        "grp_no": "1",  # 그룹번호
+        "refresh": "1",  # 기존 등록 유지 여부
+        # 등록할 종목(item)과 실시간 타입(type)
+        "data": [{"item": ['005930'], "type": ['0F']}],
+    }
+
+    # 같은 스트림을 두 소비자에 분배: 가공(print_dataframe) / 원본 로깅(log_raw)
+    await run_pubsub(
+        get_ws_client(),
+        api_url=API_URL,
+        bodies=body,
+        consumers={
+            "kiwoom.realtime": print_dataframe,
+            "kiwoom.all": log_raw,
+        },
+        columns=COLUMNS,
+        max_messages=10,
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
