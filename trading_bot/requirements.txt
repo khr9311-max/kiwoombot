@@ -1,0 +1,15 @@
+# --- 핵심 ---
+requests>=2.31
+websockets>=12.0
+python-dotenv>=1.0
+APScheduler>=3.10
+pandas>=2.0
+numpy>=1.24
+
+# --- 장 전 스크리닝 ---
+pykrx>=1.0.45
+
+# --- ML 확장 슬롯 (메타 라벨링) ---
+lightgbm>=4.1
+scikit-learn>=1.3
+scipy>=1.11

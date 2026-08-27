@@ -22,3 +22,11 @@ Desktop.ini
 *.secret
 credentials.json
 token.json
+
+# 봇 런타임 산출물
+trading_bot/.env
+trading_bot/data/
+trading_bot/logs/
+trading_bot/models/*.pkl
+.venv/
+.pytest_cache/

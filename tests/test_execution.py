@@ -1,0 +1,365 @@
+"""
+주문 집행 · 실시간 프로토콜 테스트. 네트워크를 타지 않도록 클라이언트를 가짜로 바꾼다.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+os.environ.setdefault("KIWOOM_APP_KEY", "TESTKEY")
+os.environ.setdefault("KIWOOM_APP_SECRET", "TESTSECRET")
+os.environ.setdefault("KIWOOM_ENV", "mock")
+os.environ.setdefault("NOTIFIER", "null")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import pytest  # noqa: E402
+
+from trading_bot.config import settings as cfg  # noqa: E402
+from trading_bot.core.executor import OrderExecutor  # noqa: E402
+from trading_bot.core.kiwoom_client import KiwoomAPIError  # noqa: E402
+from trading_bot.core.kiwoom_ws import KiwoomWebSocket  # noqa: E402
+from trading_bot.core.notifier import NullNotifier  # noqa: E402
+from trading_bot.core.risk_manager import ExitOrder, RiskManager  # noqa: E402
+from trading_bot.database.db import Database  # noqa: E402
+
+
+# ------------------------------------------------------------------ 더미들
+class FakeClient:
+    """키움 REST 클라이언트 대역. 보낸 주문을 기록만 한다."""
+
+    def __init__(self, dry_run: bool = False, fail_on: set[str] | None = None):
+        self.dry_run = dry_run
+        self.sent: list[tuple[str, dict]] = []
+        self.fail_on = fail_on or set()
+        self._seq = 0
+        self.unfilled: list[dict] = []
+
+    def _next(self) -> str:
+        self._seq += 1
+        return f"ORD{self._seq:05d}"
+
+    def buy(self, code, qty, price="", trade_type="7", cond_price=""):
+        if "buy" in self.fail_on:
+            raise KiwoomAPIError("kt10000", 3, "주문가능금액 부족")
+        self.sent.append(("BUY", {"code": code, "qty": qty, "price": price, "tt": trade_type}))
+        return {"ord_no": self._next(), "return_code": 0}
+
+    def sell(self, code, qty, price="", trade_type="3", cond_price=""):
+        if "sell" in self.fail_on:
+            raise KiwoomAPIError("kt10001", 3, "주문 거부")
+        self.sent.append(("SELL", {"code": code, "qty": qty, "price": price, "tt": trade_type}))
+        return {"ord_no": self._next(), "return_code": 0}
+
+    def cancel(self, orig_order_no, code, qty=0):
+        if "cancel" in self.fail_on:
+            raise KiwoomAPIError("kt10003", 3, "이미 체결된 주문")
+        self.sent.append(("CANCEL", {"ord_no": orig_order_no, "code": code, "qty": qty}))
+        return {"ord_no": self._next(), "return_code": 0}
+
+    def get_unfilled(self, *a, **k):
+        return self.unfilled
+
+    def get_quote(self, code):
+        return {"price": 10_000}
+
+
+@pytest.fixture
+def rig(tmp_path, monkeypatch):
+    monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "t.db")
+    # 진입 차단 시각(기본 14:30)에 걸려 테스트가 실행 시간에 좌우되지 않도록 고정한다.
+    monkeypatch.setattr(cfg, "NO_NEW_ENTRY_AFTER", datetime(2026, 1, 1, 23, 59).time())
+    db = Database(tmp_path / "t.db")
+    risk = RiskManager()
+    risk.cash = risk.orderable_cash = risk.total_equity = 10_000_000
+    risk.reset_day(10_000_000)
+    client = FakeClient()
+    ex = OrderExecutor(client, risk, db, NullNotifier())
+    return client, risk, db, ex
+
+
+def fill_msg(order_no, code, side, qty, price, remain=0, name="테스트"):
+    """실시간 주문체결(00) 메시지 values 블록."""
+    return {
+        "9203": order_no, "9001": f"A{code}", "302": name,
+        "913": "체결", "900": str(qty), "901": str(int(price)),
+        "902": str(remain), "907": "1" if side == "SELL" else "2",
+        "910": f"+{int(price)}", "911": str(qty), "938": "150", "939": "0",
+    }
+
+
+# ------------------------------------------------------------------ 진입
+class TestBuyFlow:
+    def test_order_then_realtime_fill_opens_position(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        assert po is not None
+        assert client.sent[0][0] == "BUY"
+        # 체결 대기 중이라는 '그 이유로' 막혀야 한다 (시각 제한 등 다른 이유가 아니라)
+        ok, why = risk.can_buy("005930", 70_000)
+        assert ok is False and "체결 대기" in why
+
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 10, 70_000))
+        pos = risk.positions["005930"]
+        assert pos.qty == 10 and pos.avg_price == 70_000
+        assert ex.pending == {}
+        assert ex.stats.buy_fills == 1
+
+    def test_partial_fills_accumulate(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 4, 70_000, remain=6))
+        assert risk.positions["005930"].qty == 4
+        assert po.order_no in ex.pending          # 잔량이 남아 계속 추적
+
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 6, 70_100, remain=0))
+        pos = risk.positions["005930"]
+        assert pos.qty == 10
+        assert pos.avg_price == pytest.approx(70_060)   # 가중평균
+        assert ex.pending == {}
+
+    def test_slippage_guard_blocks_chase(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "SLIPPAGE_GUARD_PCT", 0.01)
+        client, risk, db, ex = rig
+        # 시그널가 70,000 인데 현재가가 71,500 (+2.14%) -> 포기
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 71_500) is None
+        assert client.sent == []
+        assert ex.stats.slippage_blocks == 1
+        # 0.5% 상승은 허용
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_350) is not None
+
+    def test_rejected_order_clears_pending_state(self, rig):
+        client, risk, db, ex = rig
+        client.fail_on = {"buy"}
+        risk.mark_pending_buy("005930", 10)
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000) is None
+        assert ex.stats.rejects == 1
+        # 거부되면 대기 상태를 풀어야 다음 기회를 잡을 수 있다
+        assert risk.can_buy("005930", 70_000)[0] is True
+
+
+# ------------------------------------------------------------------ 청산
+class TestSellFlow:
+    def test_exit_records_completed_trade(self, rig):
+        client, risk, db, ex = rig
+        risk.open_position("005930", 10, 70_000, name="삼성전자")
+        po = ex.submit_exit(ExitOrder("005930", 10, "손절 -2.00%"), 68_600)
+        assert po is not None and client.sent[-1][0] == "SELL"
+        assert risk.positions["005930"].pending_exit == "손절 -2.00%"
+
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "SELL", 10, 68_600))
+        assert "005930" not in risk.positions
+
+        rows = db.today_stats()
+        assert rows["trades"] == 1
+        assert rows["realized"] == pytest.approx((68_600 - 70_000) * 10)
+
+    def test_partial_take_profit_marks_flag_and_keeps_rest(self, rig):
+        client, risk, db, ex = rig
+        risk.open_position("005930", 10, 70_000, name="삼성전자")
+        po = ex.submit_exit(ExitOrder("005930", 5, "1차익절 +3.00%"), 72_100)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "SELL", 5, 72_100))
+
+        pos = risk.positions["005930"]
+        assert pos.qty == 5
+        assert pos.took_profit is True      # 이제 트레일링 스탑이 활성화된다
+        assert pos.pending_exit == ""
+
+    def test_exit_not_duplicated_while_pending(self, rig):
+        client, risk, db, ex = rig
+        risk.open_position("005930", 10, 70_000, name="삼성전자")
+        ex.submit_exit(ExitOrder("005930", 10, "손절"), 68_000)
+        sells = [s for s in client.sent if s[0] == "SELL"]
+        # pending_exit 이 걸려 있으면 RiskManager 가 재판정을 하지 않는다
+        assert risk.check_exit(risk.positions["005930"], 60_000) is None
+        assert len(sells) == 1
+
+
+# ------------------------------------------------------------------ 미체결
+class TestUnfilledSweep:
+    def test_cancels_stale_buy_and_retries_once(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "UNFILLED_TIMEOUT_SEC", 30)
+        monkeypatch.setattr(cfg, "UNFILLED_MAX_CHASE", 1)
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        po.sent_at = datetime.now() - timedelta(seconds=31)
+
+        ex.sweep_unfilled(lambda c: 70_050)
+        kinds = [s[0] for s in client.sent]
+        assert "CANCEL" in kinds
+        assert kinds.count("BUY") == 2         # 취소 후 1회 재시도
+        assert ex.stats.cancels == 1
+
+    def test_stale_sell_is_resent_not_abandoned(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "UNFILLED_TIMEOUT_SEC", 30)
+        client, risk, db, ex = rig
+        risk.open_position("005930", 10, 70_000, name="삼성전자")
+        po = ex.submit_exit(ExitOrder("005930", 10, "손절"), 68_000)
+        po.sent_at = datetime.now() - timedelta(seconds=31)
+
+        ex.sweep_unfilled(lambda c: 67_900)
+        sells = [s for s in client.sent if s[0] == "SELL"]
+        assert len(sells) == 2                 # 청산은 반드시 나가야 한다
+        assert "재전송" in list(ex.pending.values())[0].reason
+
+    def test_cancel_failure_stops_tracking(self, rig, monkeypatch):
+        """이미 체결된 주문의 취소는 실패한다. 무한 재시도에 빠지면 안 된다."""
+        monkeypatch.setattr(cfg, "UNFILLED_TIMEOUT_SEC", 30)
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        po.sent_at = datetime.now() - timedelta(seconds=31)
+        client.fail_on = {"cancel"}
+
+        ex.sweep_unfilled(lambda c: 70_000)
+        assert ex.pending == {}
+
+    def test_reconcile_clears_orders_missing_from_broker(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        client.unfilled = []                   # 증권사 원장에 없다 = 체결 또는 취소됨
+        ex.reconcile()
+        assert ex.pending == {}
+        assert risk.can_buy("005930", 70_000)[0] is True
+
+
+# ------------------------------------------------------------------ DRY-RUN
+class TestDryRun:
+    def test_no_order_is_sent_but_state_advances(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cfg, "DB_PATH", tmp_path / "d.db")
+        db = Database(tmp_path / "d.db")
+        risk = RiskManager()
+        risk.cash = risk.orderable_cash = risk.total_equity = 10_000_000
+        risk.reset_day(10_000_000)
+        client = FakeClient(dry_run=True)
+        ex = OrderExecutor(client, risk, db, NullNotifier())
+
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        assert po is not None
+        # 실제 주문 API 는 호출되었지만 FakeClient 라 기록만 남는다.
+        # 진짜 KiwoomClient 의 dry_run 경로는 _send_order 에서 차단된다(아래 테스트).
+        assert risk.positions["005930"].qty == 10      # 즉시 체결 시뮬레이션
+        assert ex.pending == {}
+
+    def test_real_client_dry_run_never_calls_request(self, monkeypatch):
+        from trading_bot.core.kiwoom_client import KiwoomClient
+
+        client = KiwoomClient(app_key="k", app_secret="s", dry_run=True)
+        called = []
+        monkeypatch.setattr(client, "request", lambda *a, **k: called.append(a))
+
+        res = client.buy("005930", 10, "", "7")
+        assert called == []                    # HTTP 요청이 한 번도 나가지 않는다
+        assert res["dry_run"] is True
+        assert res["ord_no"].startswith("DRY")
+
+        client.sell("005930", 10)
+        client.cancel("X", "005930", 10)
+        assert called == []
+
+
+# ------------------------------------------------------------------ 실시간
+class TestWebSocketProtocol:
+    """LOGIN -> REG -> REAL, PING 에코, 재접속 시 구독 복원."""
+
+    class FakeWS:
+        def __init__(self, script):
+            self.sent: list[dict] = []
+            self._script = list(script)
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+        async def recv(self):
+            return json.dumps(self._script.pop(0))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._script:
+                raise StopAsyncIteration
+            return json.dumps(self._script.pop(0))
+
+        async def close(self):
+            pass
+
+    def _ws(self, script, on_tick=None, on_fill=None):
+        ws = KiwoomWebSocket(token_provider=lambda: "TOKEN", on_tick=on_tick, on_fill=on_fill)
+        ws._ws = self.FakeWS(script)
+        return ws
+
+    def test_login_sends_token(self):
+        ws = self._ws([{"trnm": "LOGIN", "return_code": 0}])
+        asyncio.run(ws._login())
+        assert ws._ws.sent[0] == {"trnm": "LOGIN", "token": "TOKEN"}
+
+    def test_login_failure_raises(self):
+        ws = self._ws([{"trnm": "LOGIN", "return_code": 1, "return_msg": "토큰 오류"}])
+        with pytest.raises(RuntimeError):
+            asyncio.run(ws._login())
+
+    def test_ping_is_echoed_verbatim(self):
+        ping = {"trnm": "PING", "seq": 7}
+        ws = self._ws([ping])
+        asyncio.run(ws._recv_loop())
+        assert ws._ws.sent == [ping]     # 받은 그대로 되돌려야 연결이 유지된다
+
+    def test_real_0B_tick_is_dispatched(self):
+        got = []
+        values = {"20": "091530", "10": "-70800", "15": "+120", "13": "1500000",
+                  "228": "112.35"}
+        ws = self._ws(
+            [{"trnm": "REAL", "data": [{"type": "0B", "item": "005930", "values": values}]}],
+            on_tick=lambda code, v: got.append((code, v)),
+        )
+        asyncio.run(ws._recv_loop())
+        assert got[0][0] == "005930"
+        assert got[0][1]["228"] == "112.35"
+
+    def test_real_00_fill_is_dispatched(self):
+        got = []
+        ws = self._ws(
+            [{"trnm": "REAL", "data": [{"type": "00", "item": "", "values": {"9203": "1"}}]}],
+            on_fill=lambda v: got.append(v),
+        )
+        asyncio.run(ws._recv_loop())
+        assert got == [{"9203": "1"}]
+
+    def test_callback_exception_does_not_kill_the_stream(self):
+        seen = []
+
+        def boom(code, v):
+            seen.append(code)
+            raise ValueError("콜백 폭발")
+
+        ws = self._ws(
+            [
+                {"trnm": "REAL", "data": [{"type": "0B", "item": "A", "values": {}}]},
+                {"trnm": "REAL", "data": [{"type": "0B", "item": "B", "values": {}}]},
+            ],
+            on_tick=boom,
+        )
+        asyncio.run(ws._recv_loop())
+        assert seen == ["A", "B"]     # 첫 예외 후에도 계속 수신한다
+
+    def test_subscribe_registers_and_restores(self):
+        ws = self._ws([])
+        asyncio.run(ws.subscribe(["005930", "000660"]))
+        reg = ws._ws.sent[-1]
+        assert reg["trnm"] == "REG" and reg["refresh"] == "1"
+        assert reg["data"][0]["type"] == ["0B"]
+        assert sorted(reg["data"][0]["item"]) == ["000660", "005930"]
+
+        # 재접속 시 기존 구독을 복원한다
+        ws._ws = self.FakeWS([])
+        asyncio.run(ws._restore_subscriptions())
+        assert ws._ws.sent[-1]["data"][0]["item"] == ["000660", "005930"]
+
+    def test_order_subscription_uses_separate_group(self):
+        ws = self._ws([])
+        asyncio.run(ws._register_orders())
+        msg = ws._ws.sent[-1]
+        assert msg["grp_no"] == "2" and msg["data"][0]["type"] == ["00"]

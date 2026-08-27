@@ -1,0 +1,46 @@
+# /etc/systemd/system/kiwoom-bot.service
+#
+#   sudo cp kiwoom-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kiwoom-bot
+#   journalctl -u kiwoom-bot -f          # 실시간 로그
+#
+# 봇은 스케줄러를 내장하고 있으므로 24시간 상주시킨다(cron 불필요).
+
+[Unit]
+Description=Kiwoom REST API Auto Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/kiwoom-bot
+Environment="PYTHONUNBUFFERED=1"
+Environment="TZ=Asia/Seoul"
+ExecStart=/opt/kiwoom-bot/.venv/bin/python -m trading_bot.main
+
+# 죽으면 되살리되, 짧은 시간에 반복 실패하면 멈춘다(주문 폭주 방지)
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# SIGTERM 을 받으면 봇이 스스로 정리(구독 해제·알림)할 시간을 준다
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# 최소 권한
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/kiwoom-bot/data /opt/kiwoom-bot/logs /opt/kiwoom-bot/models
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kiwoom-bot
+
+[Install]
+WantedBy=multi-user.target
