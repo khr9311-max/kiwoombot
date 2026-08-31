@@ -100,9 +100,6 @@ class TradingBot:
         log.info("키움 자동매매 봇 기동 | %s", cfg.Summary().as_text())
         if cfg.DRY_RUN:
             log.warning("DRY-RUN 모드입니다. 주문 API 가 실제로 전송되지 않습니다.")
-        startup_warnings = cfg.warnings_()
-        for w in startup_warnings:
-            log.warning("설정 경고: %s", w)
         log.info("=" * 78)
 
         await asyncio.to_thread(self.client.issue_token)
@@ -113,7 +110,6 @@ class TradingBot:
             f"  환경: {cfg.KIWOOM_ENV}{' (DRY-RUN)' if cfg.DRY_RUN else ''}\n"
             f"  자산: {self.risk.total_equity:,.0f}원 / 주문가능 {self.risk.orderable_cash:,.0f}원\n"
             f"  보유: {len(self.risk.positions)}종목"
-            + "".join(f"\n⚠️ {w}" for w in startup_warnings)
         )
 
         self._tasks.append(asyncio.create_task(self.ws.run(), name="ws"))

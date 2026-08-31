@@ -7,7 +7,7 @@
 #
 # 봇은 스케줄러를 내장하고 있으므로 24시간 상주시킨다(cron 불필요).
 #
-# 인증값은 모두 WorkingDirectory 의 .env 에서 읽는다(KIWOOM_APP_KEY_*, KRX_ID/KRX_PW 등).
+# 인증값은 모두 WorkingDirectory 의 .env 에서 읽는다(KIWOOM_APP_KEY_* 등).
 # .env 를 고친 뒤에는 sudo systemctl restart kiwoom-bot 으로 반영한다.
 
 [Unit]

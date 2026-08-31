@@ -93,12 +93,6 @@ UNIVERSE_MARKETS = tuple(
 # 스크리닝을 건너뛰고 이 종목들만 감시하고 싶을 때 (쉼표구분 6자리 코드)
 FIXED_UNIVERSE = tuple(c.strip() for c in os.getenv("FIXED_UNIVERSE", "").split(",") if c.strip())
 
-# 스크리닝 일봉은 pykrx 로 받는데, data.krx.co.kr 이 비로그인 조회를 막아 두었다
-# (응답 400 "LOGOUT"). data.krx.co.kr 무료 회원 계정이 있어야 한다.
-# load_dotenv 가 .env 값을 os.environ 에 넣으므로 pykrx 가 이 값을 그대로 읽어간다.
-KRX_ID = os.getenv("KRX_ID", "").strip()
-KRX_PW = os.getenv("KRX_PW", "").strip()
-
 # ---------------------------------------------------------------- 시그널
 WARMUP_BARS = _i("WARMUP_BARS", 120)             # 시작 시 ka10080 으로 채워둘 1분봉 개수
 SIGNAL_SCORE_THRESHOLD = _f("SIGNAL_SCORE_THRESHOLD", 4.0)
@@ -218,15 +212,3 @@ def validate() -> list[str]:
     if SIZING_MODE not in ("fixed_pct", "atr_risk", "half_kelly"):
         errors.append(f"알 수 없는 SIZING_MODE: {SIZING_MODE}")
     return errors
-
-
-def warnings_() -> list[str]:
-    """치명적이지는 않지만 그냥 두면 봇이 제 일을 못 하는 설정들."""
-    warns: list[str] = []
-    if not FIXED_UNIVERSE and not (KRX_ID and KRX_PW):
-        warns.append(
-            "KRX_ID / KRX_PW 가 없습니다. data.krx.co.kr 은 로그인 없는 시세 조회를 "
-            "차단하므로 스크리닝이 실패하고 감시 유니버스가 0종목이 됩니다. "
-            "data.krx.co.kr 에서 무료 회원가입한 뒤 .env 에 넣으세요."
-        )
-    return warns

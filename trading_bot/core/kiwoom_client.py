@@ -8,6 +8,7 @@
   kt00018  POST /api/dostk/acnt     계좌평가잔고내역요청
   ka10075  POST /api/dostk/acnt     미체결요청
   ka10080  POST /api/dostk/chart    주식분봉차트조회요청
+  ka10081  POST /api/dostk/chart    주식일봉차트조회요청
   kt10000  POST /api/dostk/ordr     주식 매수주문
   kt10001  POST /api/dostk/ordr     주식 매도주문
   kt10002  POST /api/dostk/ordr     주식 정정주문
@@ -474,6 +475,33 @@ class KiwoomClient:
             if len(bars) >= count or cont_yn != "Y" or not next_key:
                 break
         bars.sort(key=lambda b: b["time"])
+        return bars[-count:]
+
+    def get_daily_chart(self, code: str, count: int = 90, adjusted: bool = True) -> list[dict]:
+        """ka10081 주식일봉차트조회. 과거->현재 오름차순 리스트로 반환.
+        trde_prica(거래대금) 는 백만원 단위로 오므로 원 단위로 환산해 둔다."""
+        base_dt = datetime.now().strftime("%Y%m%d")
+        body = {"stk_cd": code, "base_dt": base_dt, "upd_stkpc_tp": "1" if adjusted else "0"}
+        bars: list[dict] = []
+        cont_yn, next_key = "N", ""
+        for _ in range(10):
+            data, cont_yn, next_key = self.request("ka10081", "/api/dostk/chart", body, cont_yn, next_key)
+            rows = data.get("stk_dt_pole_chart_qry") or []
+            for r in rows:
+                dt = (r.get("dt") or "").strip()
+                if len(dt) != 8:
+                    continue
+                bars.append(
+                    {
+                        "date": dt,
+                        "close": parse_price(r.get("cur_prc")),
+                        "volume": parse_int(r.get("trde_qty")),
+                        "value": parse_int(r.get("trde_prica")) * 1_000_000,
+                    }
+                )
+            if len(bars) >= count or cont_yn != "Y" or not next_key:
+                break
+        bars.sort(key=lambda b: b["date"])
         return bars[-count:]
 
     def get_quote(self, code: str) -> dict:

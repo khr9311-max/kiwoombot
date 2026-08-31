@@ -1,37 +1,32 @@
 """
 [1단계] 장 전 종목 스크리닝 — 전 종목(2,500+) 을 감시 유니버스(10~30) 로 압축.
 
-두 개의 데이터 소스를 조합한다.
-  - 키움 ka10099 (종목정보 리스트): 종목 마스터 + 거래 가능 여부
+키움 REST API 만으로 구성한다.
+  - ka10099 (종목정보 리스트): 종목 마스터 + 거래 가능 여부 + 현재가/상장주식수
       state       : 종목상태 (관리종목 / 거래정지 / 투자유의 등)
       auditInfo   : 감사정보 (투자주의환기종목 등)
       orderWarning: 투자경고/위험 단계 ("0" 이 정상)
       upName      : 업종명, ETF 는 "" 로 온다
-  - pykrx: 일봉 시세 / 시가총액 (거래대금·이동평균·거래량 급증 판정)
+      lastPrice/listCount: 시가총액 계산용 (별도 API 불필요)
+  - ka10081 (주식일봉차트조회): 종목별 일봉 (거래대금·이동평균·거래량 급증 판정)
 
-data.krx.co.kr 은 비로그인 조회를 차단하므로(응답 400 "LOGOUT") pykrx 를 쓰려면
-KRX_ID / KRX_PW 환경 변수가 반드시 있어야 한다. 없으면 pykrx 는 예외 대신 빈
-DataFrame 을 돌려주고 안내문을 stdout 으로만 print 하기 때문에, 아래에서 stdout 을
-가로채 로그로 남기고 원인을 ScreenerError 로 올려 텔레그램 알림까지 전달한다.
-
-pykrx 는 날짜별 횡단면 조회가 종목별 조회보다 훨씬 빠르므로, 최근 N영업일 패널을
-data/daily_panel.pkl 에 캐시해 두고 매일 없는 날짜만 증분으로 받아온다.
+예전에는 pykrx 로 KRX(data.krx.co.kr) 를 스크래핑했으나, KRX Data Marketplace
+이용약관 제10조 제2호가 "자동화 수단을 통한 정보 수집"을 명시적으로 금지하고
+있고 실제로 접속 IP 가 하루 차단당하는 사고가 있었다. 게다가 pykrx 는 실제
+호출 여부와 무관하게 import 시점에 KRX 로그인을 시도한다. 그래서 일봉/시총
+조회를 전부 키움 공식 API 로 옮겼다 — 속도는 더 느리지만(종목별 순차 호출)
+약관 위반·차단 위험이 없다.
 """
 from __future__ import annotations
 
-import contextlib
-import io
 import logging
-import os
-import pickle
-import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 
 from ..config import settings as cfg
-from .kiwoom_client import KiwoomClient, norm_code, parse_price
+from .kiwoom_client import KiwoomAPIError, KiwoomClient, norm_code, parse_price
 
 log = logging.getLogger(__name__)
 
@@ -41,37 +36,11 @@ NAME_EXCLUDE_KEYWORDS = ("스팩", "제1호", "리츠", "인수권")
 STATE_EXCLUDE_KEYWORDS = ("관리", "거래정지", "정지", "투자유의", "환기", "정리매매", "우선주")
 MARKET_CODES = {"KOSPI": "0", "KOSDAQ": "10"}
 
-PANEL_PATH = cfg.DATA_DIR / "daily_panel.pkl"
 UNIVERSE_PATH = cfg.DATA_DIR / "universe.json"
-
-KRX_LOGIN_HINT = (
-    "data.krx.co.kr 은 로그인 없는 시세 조회를 차단합니다. "
-    "data.krx.co.kr 에서 무료 회원가입한 뒤 .env 에 KRX_ID / KRX_PW 를 넣으세요"
-)
 
 
 class ScreenerError(RuntimeError):
-    """스크리닝을 진행할 수 없는 상태(데이터 소스 장애·인증 누락 등)."""
-
-
-def krx_login_ready() -> bool:
-    """pykrx 가 KRX 로그인에 쓰는 환경 변수가 채워져 있는지."""
-    return bool(os.getenv("KRX_ID", "").strip() and os.getenv("KRX_PW", "").strip())
-
-
-def _pykrx(fn, *args, **kwargs):
-    """
-    pykrx 호출 래퍼. pykrx 는 로그인 실패·JSON 파싱 실패를 예외가 아니라 stdout
-    print 로 알리므로, 그대로 두면 원인이 로그 어디에도 남지 않는다.
-    """
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        result = fn(*args, **kwargs)
-    for line in buf.getvalue().splitlines():
-        line = line.strip()
-        if line:
-            log.warning("pykrx: %s", line)
-    return result
+    """스크리닝을 진행할 수 없는 상태(데이터 소스 장애 등)."""
 
 
 @dataclass
@@ -154,135 +123,41 @@ def filter_tradable(master: pd.DataFrame) -> pd.DataFrame:
 
 def is_trading_day(day: date | None = None) -> bool:
     """
-    오늘이 개장일인지 확인한다(주말 + 공휴일).
-    조회에 실패하면 True 를 돌려준다 — 휴장일에 잘못 도는 것보다
-    개장일에 봇이 안 도는 쪽이 더 나쁘기 때문이다. 휴장일에 돌아도 시세가 없어
-    아무 일도 일어나지 않는다.
+    오늘이 개장일인지 확인한다(주말만 걸러낸다).
+    공휴일은 걸러내지 않는다 — 휴장일에 스크리닝이 돌아도 시세가 없어
+    아무 일도 일어나지 않으므로, 굳이 외부 휴장일 조회에 기대지 않는다.
     """
     day = day or date.today()
-    if day.weekday() >= 5:
-        return False
-    try:
-        from pykrx import stock
-
-        nearest = stock.get_nearest_business_day_in_a_week(day.strftime("%Y%m%d"), prev=False)
-    except Exception as exc:
-        log.warning("개장일 확인 실패(%s) — 개장일로 간주하고 진행합니다", exc)
-        return True
-    return str(nearest) == day.strftime("%Y%m%d")
+    return day.weekday() < 5
 
 
 # ------------------------------------------------------------------ 일봉 패널
-def _business_days(end: date, count: int) -> list[str]:
-    """주말을 뺀 최근 count 영업일(YYYYMMDD). 공휴일은 pykrx 가 빈 결과로 알려준다."""
-    days: list[str] = []
-    cur = end
-    while len(days) < count:
-        if cur.weekday() < 5:
-            days.append(cur.strftime("%Y%m%d"))
-        cur -= timedelta(days=1)
-    return sorted(days)
-
-
-def _load_panel() -> pd.DataFrame:
-    try:
-        with PANEL_PATH.open("rb") as fh:
-            return pickle.load(fh)
-    except (OSError, pickle.UnpicklingError, EOFError):
-        return pd.DataFrame(columns=["date", "code", "close", "volume", "value"])
-
-
-def _save_panel(panel: pd.DataFrame) -> None:
-    try:
-        with PANEL_PATH.open("wb") as fh:
-            pickle.dump(panel, fh)
-    except OSError as exc:
-        log.warning("일봉 패널 캐시 저장 실패: %s", exc)
-
-
-def build_panel(lookback_days: int = 90, markets: tuple[str, ...] = cfg.UNIVERSE_MARKETS) -> pd.DataFrame:
-    """
-    최근 lookback_days 영업일의 (date, code, close, volume, value) 패널.
-    캐시에 없는 날짜만 pykrx 로 받아온다.
-    """
-    from pykrx import stock  # 무거운 import 라 함수 안에서
-
-    wanted = _business_days(date.today() - timedelta(days=1), lookback_days)
-    panel = _load_panel()
-    have = set(panel["date"].unique()) if not panel.empty else set()
-    missing = [d for d in wanted if d not in have]
-
-    # 공휴일은 캐시에 영원히 안 채워지므로 missing 에 남는다. 따라서 "덜 받아온 것"
-    # 자체는 정상이고, 조회가 예외로 터진 횟수만 장애 신호로 센다.
-    if missing and not krx_login_ready():
-        raise ScreenerError(f"KRX 계정(KRX_ID/KRX_PW)이 설정되지 않았습니다 — {KRX_LOGIN_HINT}")
-
-    if missing:
-        log.info("일봉 패널 증분 수집: %d일 (%s ~ %s)", len(missing), missing[0], missing[-1])
-    new_frames: list[pd.DataFrame] = []
+def build_panel(client: KiwoomClient, codes: list[str], lookback_days: int = 90) -> pd.DataFrame:
+    """키움 ka10081 로 종목별 일봉을 받아 (date, code, close, volume, value) 패널을 만든다."""
+    rows: list[dict] = []
     errors = 0
     last_error = ""
-    for day in missing:
-        for market in markets:
-            try:
-                df = _pykrx(stock.get_market_ohlcv, day, market=market.upper())
-            except Exception as exc:
-                log.warning("pykrx %s %s 조회 실패: %s", day, market, exc)
-                errors += 1
-                last_error = str(exc)
-                continue
-            if df is None or df.empty or df["거래량"].sum() == 0:
-                continue  # 휴장일
-            part = pd.DataFrame(
-                {
-                    "date": day,
-                    "code": df.index.astype(str),
-                    "close": df["종가"].astype(float),
-                    "volume": df["거래량"].astype(float),
-                    "value": df["거래대금"].astype(float),
-                }
+    total = len(codes)
+    for i, code in enumerate(codes, 1):
+        try:
+            bars = client.get_daily_chart(code, count=lookback_days)
+        except KiwoomAPIError as exc:
+            errors += 1
+            last_error = exc.msg
+            continue
+        for b in bars:
+            rows.append(
+                {"date": b["date"], "code": code, "close": b["close"], "volume": b["volume"], "value": b["value"]}
             )
-            new_frames.append(part.reset_index(drop=True))
-            time.sleep(0.2)  # KRX 서버 배려
+        if i % 200 == 0:
+            log.info("일봉 수집 진행: %d/%d (오류 %d건)", i, total, errors)
 
-    if errors and not new_frames:
-        raise ScreenerError(
-            f"pykrx 일봉 조회가 {errors}건 모두 실패했습니다 (마지막 오류: {last_error}). "
-            f"KRX 계정이 막혔거나 비밀번호가 바뀌었을 수 있습니다 — {KRX_LOGIN_HINT}"
-        )
+    if errors and not rows:
+        raise ScreenerError(f"키움 일봉 조회가 {errors}건 모두 실패했습니다 (마지막 오류: {last_error})")
     if errors:
-        log.warning("일봉 조회 일부 실패: %d건 (마지막 오류: %s)", errors, last_error)
+        log.warning("일봉 조회 일부 실패: %d/%d건 (마지막 오류: %s)", errors, total, last_error)
 
-    if new_frames:
-        panel = pd.concat([panel, *new_frames], ignore_index=True)
-        panel = panel.drop_duplicates(["date", "code"], keep="last")
-
-    if not panel.empty:
-        keep_from = min(wanted)
-        panel = panel[panel["date"] >= keep_from].reset_index(drop=True)
-        _save_panel(panel)
-    return panel
-
-
-def fetch_market_cap(markets: tuple[str, ...] = cfg.UNIVERSE_MARKETS) -> pd.Series:
-    """가장 최근 영업일의 시가총액(원). index=code"""
-    from pykrx import stock
-
-    for day in reversed(_business_days(date.today(), 7)):
-        frames = []
-        for market in markets:
-            try:
-                df = _pykrx(stock.get_market_cap, day, market=market.upper())
-            except Exception as exc:
-                log.warning("pykrx 시가총액 %s %s 실패: %s", day, market, exc)
-                continue
-            if df is not None and not df.empty and df["시가총액"].sum() > 0:
-                frames.append(df["시가총액"].astype(float))
-        if frames:
-            log.info("시가총액 기준일: %s", day)
-            return pd.concat(frames)
-    log.error("시가총액 조회 실패 — 시총 필터를 건너뜁니다")
-    return pd.Series(dtype=float)
+    return pd.DataFrame(rows, columns=["date", "code", "close", "volume", "value"])
 
 
 # ------------------------------------------------------------------ 스크리닝
@@ -298,11 +173,10 @@ def screen(client: KiwoomClient, top_n: int = cfg.UNIVERSE_MAX) -> list[Candidat
     if master.empty:
         raise ScreenerError("종목 마스터가 비어 있습니다 (키움 ka10099 응답 확인)")
 
-    panel = build_panel(lookback_days=max(cfg.MA_TREND_PERIOD + 20, 90))
+    panel = build_panel(client, master["code"].tolist(), lookback_days=max(cfg.MA_TREND_PERIOD + 20, 90))
     if panel.empty:
-        raise ScreenerError(f"일봉 패널이 비어 있습니다 — {KRX_LOGIN_HINT}")
+        raise ScreenerError("일봉 패널이 비어 있습니다 (키움 ka10081 응답 확인)")
 
-    panel = panel[panel["code"].isin(set(master["code"]))]
     wide_close = panel.pivot(index="date", columns="code", values="close").sort_index()
     wide_vol = panel.pivot(index="date", columns="code", values="volume").sort_index()
     wide_val = panel.pivot(index="date", columns="code", values="value").sort_index()
@@ -320,7 +194,10 @@ def screen(client: KiwoomClient, top_n: int = cfg.UNIVERSE_MAX) -> list[Candidat
     vol_20 = wide_vol.tail(20).mean()
     vol_surge = (vol_5 / vol_20.replace(0.0, pd.NA)).astype(float)
     ret_5d = (wide_close.iloc[-1] / wide_close.iloc[-6] - 1.0) if len(wide_close) > 5 else last_close * 0
-    market_cap = fetch_market_cap()
+
+    # 시가총액 = 현재가 x 상장주식수 (ka10099 마스터에 이미 들어 있어 별도 조회가 필요 없다)
+    master_idx = master.set_index("code")
+    market_cap = master_idx["last_price"] * master_idx["listing_shares"]
 
     stats = pd.DataFrame(
         {
