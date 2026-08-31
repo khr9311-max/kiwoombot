@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -145,6 +146,10 @@ def build_panel(client: KiwoomClient, codes: list[str], lookback_days: int = 90)
             errors += 1
             last_error = exc.msg
             continue
+        finally:
+            # ka10081 서버측 제한이 REST_RATE_PER_SEC(주문·계좌 조회용) 보다 훨씬
+            # 엄격해서, 수천 종목을 그 속도로 두들기면 거의 매 호출이 429 로 막힌다.
+            time.sleep(cfg.SCREEN_REQUEST_DELAY_SEC)
         for b in bars:
             rows.append(
                 {"date": b["date"], "code": code, "close": b["close"], "volume": b["volume"], "value": b["value"]}

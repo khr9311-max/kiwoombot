@@ -87,6 +87,10 @@ MIN_PRICE = _f("MIN_PRICE", 2_000)
 MAX_PRICE = _f("MAX_PRICE", 500_000)
 MA_TREND_PERIOD = _i("MA_TREND_PERIOD", 60)                  # 60일선 위
 VOLUME_SURGE_RATIO = _f("VOLUME_SURGE_RATIO", 1.5)           # 최근 5일 / 20일 평균 >= 1.5
+# 종목별 일봉(ka10081) 순차 조회 간 지연. REST_RATE_PER_SEC 보다 훨씬 낮게 잡는다 —
+# 이 값을 REST_RATE_PER_SEC 자체를 낮춰서 대신하면 실거래 주문·취소 응답성까지
+# 함께 느려지므로, 스크리닝 루프에만 별도로 완만하게 페이싱한다.
+SCREEN_REQUEST_DELAY_SEC = _f("SCREEN_REQUEST_DELAY_SEC", 0.5)
 UNIVERSE_MARKETS = tuple(
     m.strip().upper() for m in os.getenv("UNIVERSE_MARKETS", "KOSPI,KOSDAQ").split(",") if m.strip()
 )
