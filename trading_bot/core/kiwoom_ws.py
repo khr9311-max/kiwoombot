@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -46,6 +47,37 @@ log = logging.getLogger(__name__)
 TickHandler = Callable[[str, dict[str, str]], Awaitable[None] | None]
 FillHandler = Callable[[dict[str, str]], Awaitable[None] | None]
 
+# 토큰을 다시 발급받고 재접속해야 하는 로그인 실패 코드
+AUTH_RETRY_CODES = frozenset({8003, 8005, 8006, 8009, 8015, 8016, 8031, 8103})
+
+
+def _parse(raw: Any) -> Any:
+    """JSON 이면 dict/list 로, 아니면 원문 문자열 그대로 돌려준다."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return raw
+        try:
+            return json.loads(text)
+        except ValueError:
+            return raw
+    return raw
+
+
+def _is_ping(message: Any) -> bool:
+    """PING 은 {"trnm":"PING"} 으로도, 맨 문자열 "PING" 으로도 온다."""
+    if isinstance(message, str):
+        return message.strip().upper() == "PING"
+    if isinstance(message, dict):
+        return str(message.get("trnm", "")).upper() == "PING"
+    return False
+
+
+def _serialize(message: Any) -> str:
+    return message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+
 
 class KiwoomWebSocket:
     """자동 재접속 + 등록 복원을 하는 실시간 시세 클라이언트."""
@@ -56,11 +88,14 @@ class KiwoomWebSocket:
         url: str = cfg.WS_HOST,
         on_tick: TickHandler | None = None,
         on_fill: FillHandler | None = None,
+        token_refresher: Callable[[], Any] | None = None,
     ):
         self._token_provider = token_provider
+        self._token_refresher = token_refresher
         self._url = url
         self._on_tick = on_tick
         self._on_fill = on_fill
+        self._auth_failed = False
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._connected = asyncio.Event()
@@ -90,6 +125,14 @@ class KiwoomWebSocket:
                 self._connected.clear()
             if self._stop.is_set():
                 break
+            # 토큰 때문에 로그인이 거부된 것이라면, 같은 토큰으로 재접속해봐야 소용없다.
+            if self._auth_failed and self._token_refresher is not None:
+                log.info("WS 인증 실패 -> 접근토큰 재발급 후 재접속")
+                try:
+                    await asyncio.to_thread(self._token_refresher)
+                    self._auth_failed = False
+                except Exception as exc:
+                    log.error("접근토큰 재발급 실패: %s", exc)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
@@ -108,17 +151,40 @@ class KiwoomWebSocket:
     # ------------------------------------------------------------ 내부
     async def _login(self) -> None:
         await self._send({"trnm": "LOGIN", "token": self._token_provider()})
-        raw = await asyncio.wait_for(self._ws.recv(), timeout=15)
-        body = json.loads(raw)
-        if body.get("trnm") != "LOGIN" or body.get("return_code") not in (0, None):
-            raise RuntimeError(f"WS LOGIN 실패: {body}")
+
+        # LOGIN 응답보다 PING 이 먼저 도착할 수 있다. PING 은 에코하고 계속 기다린다.
+        while True:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=15)
+            body = _parse(raw)
+            if _is_ping(body):
+                await self._send(body)
+                continue
+            break
+
+        if not isinstance(body, dict) or str(body.get("trnm", "")).upper() != "LOGIN":
+            raise RuntimeError(f"WS LOGIN 응답이 아님: {body}")
+
+        code = body.get("return_code")
+        code = int(code) if str(code).strip().lstrip("-").isdigit() else None
+        if code is not None and code != 0:
+            msg = str(body.get("return_msg", ""))
+            embedded = re.search(r"\[(\d{3,5}):|CODE=(\d{3,5})", msg)
+            if embedded:
+                code = int(embedded.group(1) or embedded.group(2))
+            # 토큰 문제면 재발급을 요청해 두고 예외를 던진다 -> run() 이 재접속한다.
+            if code in AUTH_RETRY_CODES:
+                self._auth_failed = True
+                raise RuntimeError(f"WS LOGIN 인증 실패(코드 {code}): {msg}")
+            raise RuntimeError(f"WS LOGIN 실패(코드 {code}): {msg}")
+
+        self._auth_failed = False
         self._connected.set()
         log.info("WebSocket LOGIN 성공 (%s)", self._url)
 
-    async def _send(self, payload: dict) -> None:
+    async def _send(self, payload: Any) -> None:
         if self._ws is None:
             raise RuntimeError("WebSocket 미연결")
-        await self._ws.send(json.dumps(payload))
+        await self._ws.send(_serialize(payload))
 
     async def _restore_subscriptions(self) -> None:
         if self._order_registered:
@@ -129,23 +195,27 @@ class KiwoomWebSocket:
     async def _recv_loop(self) -> None:
         assert self._ws is not None
         async for raw in self._ws:
-            try:
-                body = json.loads(raw)
-            except ValueError:
+            body = _parse(raw)
+
+            # PING 은 JSON({"trnm":"PING"}) 으로도, 맨 문자열("PING") 로도 올 수 있다.
+            # 받은 그대로 되돌려 보내야 서버가 연결을 유지한다.
+            if _is_ping(body):
+                await self._send(body)
+                continue
+
+            if not isinstance(body, dict):
                 log.debug("WS 파싱 불가 메시지: %.200s", raw)
                 continue
 
             trnm = body.get("trnm")
-            if trnm == "PING":
-                # 받은 그대로 되돌려 보내야 서버가 연결을 유지한다.
-                await self._send(body)
-                continue
             if trnm == "REAL":
                 await self._dispatch_real(body.get("data") or [])
                 continue
             if trnm in ("REG", "REMOVE"):
-                if body.get("return_code") not in (0, None):
-                    log.error("WS %s 실패: %s", trnm, body.get("return_msg"))
+                rc = body.get("return_code")
+                rc = int(rc) if str(rc).strip().lstrip("-").isdigit() else None
+                if rc is not None and rc != 0:
+                    log.error("WS %s 실패(코드 %s): %s", trnm, rc, body.get("return_msg"))
                 continue
             log.debug("WS 기타 메시지: %s", body)
 

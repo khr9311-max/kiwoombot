@@ -49,8 +49,11 @@ WS_HOST = (
     else "wss://api.kiwoom.com:10000/api/dostk/websocket"
 )
 
-APP_KEY = os.getenv("KIWOOM_APP_KEY", "")
-APP_SECRET = os.getenv("KIWOOM_APP_SECRET", "")
+# 키움은 실전과 모의투자의 앱키가 서로 다르다. 환경별 키를 따로 두고,
+# 없으면 공통 키로 폴백한다. (키가 환경과 어긋나면 return_code 8031 이 난다)
+_suffix = "MOCK" if IS_MOCK else "REAL"
+APP_KEY = os.getenv(f"KIWOOM_APP_KEY_{_suffix}") or os.getenv("KIWOOM_APP_KEY", "")
+APP_SECRET = os.getenv(f"KIWOOM_APP_SECRET_{_suffix}") or os.getenv("KIWOOM_APP_SECRET", "")
 
 # 실계좌에서 실수로 주문이 나가는 것을 막는 최후 방어선.
 # 실계좌인데 DRY_RUN 을 명시적으로 false 로 두지 않으면 자동으로 DRY_RUN 이 켜진다.
@@ -89,6 +92,12 @@ UNIVERSE_MARKETS = tuple(
 )
 # 스크리닝을 건너뛰고 이 종목들만 감시하고 싶을 때 (쉼표구분 6자리 코드)
 FIXED_UNIVERSE = tuple(c.strip() for c in os.getenv("FIXED_UNIVERSE", "").split(",") if c.strip())
+
+# 스크리닝 일봉은 pykrx 로 받는데, data.krx.co.kr 이 비로그인 조회를 막아 두었다
+# (응답 400 "LOGOUT"). data.krx.co.kr 무료 회원 계정이 있어야 한다.
+# load_dotenv 가 .env 값을 os.environ 에 넣으므로 pykrx 가 이 값을 그대로 읽어간다.
+KRX_ID = os.getenv("KRX_ID", "").strip()
+KRX_PW = os.getenv("KRX_PW", "").strip()
 
 # ---------------------------------------------------------------- 시그널
 WARMUP_BARS = _i("WARMUP_BARS", 120)             # 시작 시 ka10080 으로 채워둘 1분봉 개수
@@ -188,7 +197,12 @@ def validate() -> list[str]:
     """치명적 설정 오류를 리스트로 반환한다(빈 리스트면 정상)."""
     errors: list[str] = []
     if not APP_KEY or not APP_SECRET:
-        errors.append("KIWOOM_APP_KEY / KIWOOM_APP_SECRET 이 비어 있습니다 (.env 확인)")
+        errors.append(
+            f"{KIWOOM_ENV} 환경의 앱키가 비어 있습니다. .env 에 "
+            f"KIWOOM_APP_KEY_{_suffix} / KIWOOM_APP_SECRET_{_suffix} "
+            f"(또는 공통 KIWOOM_APP_KEY / KIWOOM_APP_SECRET) 를 넣으세요. "
+            f"실전과 모의투자는 앱키가 서로 다릅니다."
+        )
     if NOTIFIER == "telegram" and not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         errors.append("NOTIFIER=telegram 인데 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 없습니다")
     if NOTIFIER == "discord" and not DISCORD_WEBHOOK_URL:
@@ -204,3 +218,15 @@ def validate() -> list[str]:
     if SIZING_MODE not in ("fixed_pct", "atr_risk", "half_kelly"):
         errors.append(f"알 수 없는 SIZING_MODE: {SIZING_MODE}")
     return errors
+
+
+def warnings_() -> list[str]:
+    """치명적이지는 않지만 그냥 두면 봇이 제 일을 못 하는 설정들."""
+    warns: list[str] = []
+    if not FIXED_UNIVERSE and not (KRX_ID and KRX_PW):
+        warns.append(
+            "KRX_ID / KRX_PW 가 없습니다. data.krx.co.kr 은 로그인 없는 시세 조회를 "
+            "차단하므로 스크리닝이 실패하고 감시 유니버스가 0종목이 됩니다. "
+            "data.krx.co.kr 에서 무료 회원가입한 뒤 .env 에 넣으세요."
+        )
+    return warns

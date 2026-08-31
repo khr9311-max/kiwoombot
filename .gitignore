@@ -22,6 +22,7 @@ Desktop.ini
 *.secret
 credentials.json
 token.json
+*.pem
 
 # 봇 런타임 산출물
 trading_bot/.env

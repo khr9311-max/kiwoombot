@@ -6,37 +6,40 @@
 #   journalctl -u kiwoom-bot -f          # 실시간 로그
 #
 # 봇은 스케줄러를 내장하고 있으므로 24시간 상주시킨다(cron 불필요).
+#
+# 인증값은 모두 WorkingDirectory 의 .env 에서 읽는다(KIWOOM_APP_KEY_*, KRX_ID/KRX_PW 등).
+# .env 를 고친 뒤에는 sudo systemctl restart kiwoom-bot 으로 반영한다.
 
 [Unit]
 Description=Kiwoom REST API Auto Trading Bot
 After=network-online.target
 Wants=network-online.target
+# 죽으면 되살리되, 짧은 시간에 반복 실패하면 멈춘다(주문 폭주 방지)
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
-User=trader
-Group=trader
-WorkingDirectory=/opt/kiwoom-bot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kiwoom-bot
 Environment="PYTHONUNBUFFERED=1"
 Environment="TZ=Asia/Seoul"
-ExecStart=/opt/kiwoom-bot/.venv/bin/python -m trading_bot.main
+ExecStart=/home/ubuntu/kiwoom-bot/.venv/bin/python -m trading_bot.main
 
-# 죽으면 되살리되, 짧은 시간에 반복 실패하면 멈춘다(주문 폭주 방지)
 Restart=on-failure
 RestartSec=15
-StartLimitBurst=5
-StartLimitIntervalSec=300
 
 # SIGTERM 을 받으면 봇이 스스로 정리(구독 해제·알림)할 시간을 준다
 KillSignal=SIGTERM
 TimeoutStopSec=60
 
-# 최소 권한
+# 보안 설정
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=true
-ReadWritePaths=/opt/kiwoom-bot/data /opt/kiwoom-bot/logs /opt/kiwoom-bot/models
+ProtectHome=false
+ReadWritePaths=/home/ubuntu/kiwoom-bot/trading_bot/data /home/ubuntu/kiwoom-bot/trading_bot/logs /home/ubuntu/kiwoom-bot/trading_bot/models
 
 StandardOutput=journal
 StandardError=journal
@@ -44,3 +47,4 @@ SyslogIdentifier=kiwoom-bot
 
 [Install]
 WantedBy=multi-user.target
+

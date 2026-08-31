@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -42,6 +43,55 @@ class KiwoomAPIError(RuntimeError):
         self.msg = msg
         self.payload = payload
         super().__init__(f"[{api_id}] return_code={code} msg={msg}")
+
+
+# --------------------------------------------------------------- 응답 코드
+# 키움 공식 샘플(official_reference/kiwoom/core/errors.py) 기준.
+#
+# 중요: 키움은 업무 오류를 HTTP 200 + 본문 return_code 로 내려보낸다.
+# 토큰 만료도 401 이 아니라 return_code=8005, 또는 일반 코드(3)와 함께
+# return_msg 에 "[8005:Token이 유효하지 않습니다]" 형태로 끼워 온다.
+# HTTP 상태코드만 보면 토큰 만료를 영영 못 잡는다.
+_EMBEDDED_CODE_RE = re.compile(r"\[(\d{3,5}):|CODE=(\d{3,5})")
+
+# 토큰을 재발급하고 한 번 재시도할 코드
+AUTH_RETRY_CODES = frozenset({8003, 8005, 8006, 8009, 8015, 8016, 8031, 8103})
+# 잠시 쉬었다 재시도할 코드 (유량 제한)
+RATE_LIMIT_CODES = frozenset({1700, 1701, 1702})
+
+
+def normalize_return_code(value: Any) -> int | None:
+    """
+    return_code 를 int 로. 키움은 엔드포인트에 따라 0, "0", "0000", "8005" 처럼
+    int 와 숫자 문자열을 섞어 보낸다. 문자열 "0" 을 오류로 오인하면 안 된다.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text or not text.lstrip("-").isdigit():
+        return None
+    return int(text)
+
+
+def embedded_return_code(return_msg: Any) -> int | None:
+    """return_msg 안에 끼워 온 구체 코드를 꺼낸다. 예) '[8005:...]' / 'CODE=8005'"""
+    match = _EMBEDDED_CODE_RE.search(str(return_msg or ""))
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def _effective_code(return_code: Any, return_msg: Any) -> int | None:
+    """최상위 코드가 일반 코드(3 등)면 메시지에 끼워 온 구체 코드를 우선한다."""
+    code = normalize_return_code(return_code)
+    if code in AUTH_RETRY_CODES or code in RATE_LIMIT_CODES:
+        return code
+    embedded = embedded_return_code(return_msg)
+    if embedded in AUTH_RETRY_CODES or embedded in RATE_LIMIT_CODES:
+        return embedded
+    return code
 
 
 # --------------------------------------------------------------------- 파싱
@@ -198,8 +248,9 @@ class KiwoomClient:
             )
             resp.raise_for_status()
             body = resp.json()
-            if body.get("return_code") not in (0, None):
-                raise KiwoomAPIError("au10001", body.get("return_code"), body.get("return_msg", ""))
+            code = normalize_return_code(body.get("return_code"))
+            if code is not None and code != 0:
+                raise KiwoomAPIError("au10001", code, body.get("return_msg", ""))
             tok = AccessToken(body["token"], body.get("token_type", "bearer"), body.get("expires_dt", ""))
             self._token = tok
             self._save_cached_token(tok)
@@ -239,8 +290,11 @@ class KiwoomClient:
         """(응답본문, cont-yn, next-key) 를 반환."""
         url = f"{self.host}{path}"
         last_exc: Exception | None = None
+        auth_refreshed = False   # 토큰 재발급은 요청당 한 번만
+        attempt = 0
 
-        for attempt in range(1, cfg.REST_MAX_RETRY + 1):
+        while attempt < cfg.REST_MAX_RETRY:
+            attempt += 1
             headers = {
                 "Content-Type": "application/json;charset=UTF-8",
                 "authorization": f"Bearer {self.access_token}",
@@ -257,12 +311,14 @@ class KiwoomClient:
                 time.sleep(min(2 ** attempt * 0.3, 3.0))
                 continue
 
-            if resp.status_code == 401:
-                log.warning("[%s] 401 -> 토큰 재발급", api_id)
+            if resp.status_code == 401 and not auth_refreshed:
+                log.warning("[%s] HTTP 401 -> 토큰 재발급", api_id)
+                auth_refreshed = True
                 self.issue_token(force=True)
+                attempt -= 1        # 인증 재시도는 재시도 횟수로 세지 않는다
                 continue
             if resp.status_code == 429:
-                log.warning("[%s] 429 rate limit -> 백오프", api_id)
+                log.warning("[%s] HTTP 429 -> 백오프", api_id)
                 time.sleep(min(2 ** attempt * 0.5, 5.0))
                 continue
             if resp.status_code >= 500:
@@ -270,11 +326,37 @@ class KiwoomClient:
                 time.sleep(min(2 ** attempt * 0.3, 3.0))
                 continue
 
-            resp.raise_for_status()
-            data = resp.json()
-            code = data.get("return_code")
-            if code not in (0, None):
-                raise KiwoomAPIError(api_id, code, data.get("return_msg", ""), body)
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                last_exc = KiwoomAPIError(api_id, resp.status_code, f"JSON 아님: {resp.text[:200]}")
+                if resp.status_code >= 400:
+                    raise last_exc from exc
+                time.sleep(0.3)
+                continue
+
+            msg = data.get("return_msg", "")
+            code = _effective_code(data.get("return_code"), msg)
+
+            # 키움은 토큰 만료를 HTTP 200 + 본문 코드로 알려준다. 여기서 잡지 않으면
+            # 토큰 수명(24시간)이 끝나는 순간 봇이 통째로 멎는다.
+            if code in AUTH_RETRY_CODES and not auth_refreshed:
+                log.warning("[%s] 토큰 오류(return_code=%s, %s) -> 재발급 후 재시도", api_id, code, msg)
+                auth_refreshed = True
+                self.issue_token(force=True)
+                attempt -= 1
+                continue
+
+            if code in RATE_LIMIT_CODES:
+                wait = min(2 ** attempt * 0.5, 5.0)
+                log.warning("[%s] 유량 제한(return_code=%s) -> %.1f초 대기", api_id, code, wait)
+                last_exc = KiwoomAPIError(api_id, code, msg, body)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code >= 400 or (code is not None and code != 0):
+                raise KiwoomAPIError(api_id, code, msg, body)
+
             return data, resp.headers.get("cont-yn", "N"), resp.headers.get("next-key", "")
 
         raise KiwoomAPIError(api_id, "RETRY_EXHAUSTED", str(last_exc), body)
@@ -342,9 +424,10 @@ class KiwoomClient:
         body = {
             "all_stk_tp": "0" if all_stocks else "1",
             "trde_tp": trade_type,
-            "stk_cd": code,
             "stex_tp": "0",
         }
+        if code:  # 종목코드는 선택 파라미터 — 전체 조회 시엔 아예 보내지 않는다
+            body["stk_cd"] = code
         rows = list(self.request_all("ka10075", "/api/dostk/acnt", body, "oso"))
         return [
             {

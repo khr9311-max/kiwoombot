@@ -363,3 +363,191 @@ class TestWebSocketProtocol:
         asyncio.run(ws._register_orders())
         msg = ws._ws.sent[-1]
         assert msg["grp_no"] == "2" and msg["data"][0]["type"] == ["00"]
+
+    def test_bare_string_ping_is_echoed(self):
+        """
+        공식 클라이언트는 PING 을 JSON 뿐 아니라 맨 문자열 "PING" 으로도 받는다.
+        (근거: official_reference/kiwoom/core/ws_client.py::_is_ping_message)
+        놓치면 서버가 연결을 끊는다.
+        """
+        ws = KiwoomWebSocket(token_provider=lambda: "T")
+
+        class RawWS(self.FakeWS):
+            async def send(self, raw):
+                self.sent.append(raw)           # 원문 그대로 보관(JSON 이 아닐 수 있다)
+
+            async def __anext__(self):
+                if not self._script:
+                    raise StopAsyncIteration
+                return self._script.pop(0)      # JSON 직렬화 없이 원문 그대로
+
+        ws._ws = RawWS(["PING"])
+        asyncio.run(ws._recv_loop())
+        assert ws._ws.sent == ["PING"]          # 원문 그대로 되돌려 보낸다
+
+    def test_ping_before_login_ack_is_answered(self):
+        """LOGIN 응답보다 PING 이 먼저 와도 로그인이 성립해야 한다."""
+        ws = self._ws([{"trnm": "PING"}, {"trnm": "LOGIN", "return_code": 0}])
+        asyncio.run(ws._login())
+        assert {"trnm": "PING"} in ws._ws.sent
+        assert ws._connected.is_set()
+
+    def test_login_string_return_code_zero_is_success(self):
+        ws = self._ws([{"trnm": "LOGIN", "return_code": "0"}])
+        asyncio.run(ws._login())
+        assert ws._connected.is_set()
+
+    def test_token_error_on_login_flags_auth_failure(self):
+        """토큰 문제로 로그인이 거부되면 같은 토큰으로 재접속해도 소용없다."""
+        ws = self._ws([{"trnm": "LOGIN", "return_code": 8005, "return_msg": "토큰 만료"}])
+        with pytest.raises(RuntimeError):
+            asyncio.run(ws._login())
+        assert ws._auth_failed is True
+
+    def test_embedded_token_code_on_login_is_detected(self):
+        ws = self._ws([{"trnm": "LOGIN", "return_code": 3, "return_msg": "인증 실패 CODE=8005"}])
+        with pytest.raises(RuntimeError):
+            asyncio.run(ws._login())
+        assert ws._auth_failed is True
+
+    def test_non_auth_login_failure_does_not_flag_auth(self):
+        ws = self._ws([{"trnm": "LOGIN", "return_code": 1501, "return_msg": "입력 오류"}])
+        with pytest.raises(RuntimeError):
+            asyncio.run(ws._login())
+        assert ws._auth_failed is False
+
+
+# ------------------------------------------------------------------ 응답코드 처리
+class TestReturnCodeHandling:
+    """
+    키움은 업무 오류를 HTTP 200 + 본문 return_code 로 내려보낸다.
+    토큰 만료도 401 이 아니라 본문 코드(8005) 또는 return_msg 안의 '[8005:...]' 로 온다.
+    (근거: official_reference/kiwoom/core/client.py, errors.py)
+    """
+
+    def _client(self, monkeypatch, responses):
+        """responses: 순서대로 돌려줄 (status_code, json) 목록."""
+        from trading_bot.core.kiwoom_client import AccessToken, KiwoomClient
+
+        client = KiwoomClient(app_key="k", app_secret="s", dry_run=False)
+        client._token = AccessToken("TOK", "bearer", "20991231235959")
+
+        calls = []
+        queue = list(responses)
+
+        class FakeResp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+                self.headers = {}
+                self.text = str(payload)
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                pass
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "body": json})
+            status, payload = queue.pop(0)
+            return FakeResp(status, payload)
+
+        monkeypatch.setattr(client._session, "post", fake_post)
+        monkeypatch.setattr(client, "_bucket", type("B", (), {"acquire": lambda self: None})())
+        monkeypatch.setattr("time.sleep", lambda *_: None)
+        return client, calls
+
+    def test_string_zero_return_code_is_success(self, monkeypatch):
+        """return_code 는 0, "0", "0000" 로 섞여 온다. 문자열 0 을 오류로 보면 안 된다."""
+        for ok in (0, "0", "0000"):
+            client, _ = self._client(monkeypatch, [(200, {"return_code": ok, "entr": "1000"})])
+            data, _, _ = client.request("kt00001", "/api/dostk/acnt", {})
+            assert data["entr"] == "1000"
+
+    def test_token_expiry_in_body_triggers_refresh_and_retry(self, monkeypatch):
+        """HTTP 200 + return_code 8005 -> 토큰 재발급 후 재시도해야 한다."""
+        client, calls = self._client(monkeypatch, [
+            (200, {"return_code": 8005, "return_msg": "Token이 유효하지 않습니다"}),
+            (200, {"return_code": 0, "entr": "5000"}),
+        ])
+        refreshed = []
+        monkeypatch.setattr(client, "issue_token",
+                            lambda force=False: refreshed.append(force) or client._token)
+
+        data, _, _ = client.request("kt00001", "/api/dostk/acnt", {})
+        assert data["entr"] == "5000"
+        # access_token 조회(force=False)와 섞이므로 '강제' 재발급만 센다
+        assert refreshed.count(True) == 1
+        assert len(calls) == 2
+
+    def test_token_expiry_embedded_in_message_is_detected(self, monkeypatch):
+        """일반 코드(3) + return_msg '[8005:...]' 형태도 잡아야 한다."""
+        client, calls = self._client(monkeypatch, [
+            (200, {"return_code": 3, "return_msg": "[8005:Token이 유효하지 않습니다]"}),
+            (200, {"return_code": 0, "entr": "7000"}),
+        ])
+        refreshed = []
+        monkeypatch.setattr(client, "issue_token",
+                            lambda force=False: refreshed.append(force) or client._token)
+
+        data, _, _ = client.request("kt00001", "/api/dostk/acnt", {})
+        assert data["entr"] == "7000"
+        assert refreshed.count(True) == 1
+
+    def test_rate_limit_code_backs_off_and_retries(self, monkeypatch):
+        client, calls = self._client(monkeypatch, [
+            (200, {"return_code": 1700, "return_msg": "유량 제한"}),
+            (200, {"return_code": 0, "entr": "9000"}),
+        ])
+        data, _, _ = client.request("kt00001", "/api/dostk/acnt", {})
+        assert data["entr"] == "9000"
+        assert len(calls) == 2
+
+    def test_business_error_raises_immediately_without_retry(self, monkeypatch):
+        """입력 오류 같은 업무 오류는 재시도해도 소용없다 — 바로 올린다."""
+        client, calls = self._client(monkeypatch, [
+            (200, {"return_code": 1501, "return_msg": "입력값 오류"}),
+        ])
+        with pytest.raises(KiwoomAPIError) as exc:
+            client.request("kt10000", "/api/dostk/ordr", {})
+        assert exc.value.code == 1501
+        assert len(calls) == 1
+
+    def test_auth_refresh_happens_only_once_per_request(self, monkeypatch):
+        """재발급 후에도 계속 8005 면 무한 재발급 루프에 빠지면 안 된다."""
+        client, calls = self._client(monkeypatch, [
+            (200, {"return_code": 8005, "return_msg": "만료"}),
+            (200, {"return_code": 8005, "return_msg": "만료"}),
+        ])
+        refreshed = []
+        monkeypatch.setattr(client, "issue_token",
+                            lambda force=False: refreshed.append(force) or client._token)
+        with pytest.raises(KiwoomAPIError):
+            client.request("kt00001", "/api/dostk/acnt", {})
+        assert refreshed.count(True) == 1
+
+    def test_unfilled_omits_stock_code_when_querying_all(self, monkeypatch):
+        client, calls = self._client(monkeypatch, [(200, {"return_code": 0, "oso": []})])
+        client.get_unfilled()
+        assert "stk_cd" not in calls[0]["body"]
+        assert calls[0]["body"]["all_stk_tp"] == "0"
+
+
+# ------------------------------------------------------------------ 주문 거부
+class TestOrderRejection:
+    def test_rejection_frees_the_slot_and_alerts(self, rig):
+        """실시간 00 의 919(거부사유)가 오면 즉시 정리해야 다음 기회를 잡는다."""
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        assert risk.can_buy("005930", 70_000)[0] is False
+
+        values = fill_msg(po.order_no, "005930", "BUY", 0, 0)
+        values["911"], values["910"] = "0", "0"
+        values["919"] = "주문가능금액 부족"
+        ex.on_realtime_fill(values)
+
+        assert ex.pending == {}
+        assert risk.can_buy("005930", 70_000)[0] is True
+        assert ex.stats.rejects == 1
+        assert risk.positions == {}

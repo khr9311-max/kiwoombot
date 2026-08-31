@@ -68,6 +68,9 @@ class BarSeries:
         self._bars: deque[Bar] = deque(maxlen=maxlen)
         self._current: Bar | None = None
         self._last_cum_volume: int = 0
+        # 누적거래량 기준선이 잡혔는지. 잡히기 전에는 차분으로 체결량을 복원하지 않는다
+        # (0 을 기준선으로 빼면 첫 봉에 하루치 거래량이 통째로 들어간다).
+        self._cum_volume_seeded = False
         self.snapshot = Snapshot(code=code)
 
     # ------------------------------------------------------------ 워밍업
@@ -87,9 +90,14 @@ class BarSeries:
             )
         if rows:
             last = rows[-1]
-            self._last_cum_volume = int(last.get("cum_volume", 0))
             self.snapshot.price = last["close"]
-            self.snapshot.cum_volume = self._last_cum_volume
+            # ka10080 응답 스펙에는 누적거래량(acc_trde_qty)이 없다. 있으면 쓰고,
+            # 없으면 첫 실시간 틱에서 기준선을 잡는다.
+            cum = int(last.get("cum_volume") or 0)
+            if cum > 0:
+                self._last_cum_volume = cum
+                self._cum_volume_seeded = True
+                self.snapshot.cum_volume = cum
 
     # ------------------------------------------------------------ 틱 반영
     def on_tick(
@@ -134,11 +142,13 @@ class BarSeries:
         if bid:
             s.bid = bid
 
-        # 누적거래량 차이로 이번 틱의 체결량을 복원(필드 15 가 비어 오는 경우 대비)
-        if not tick_volume and cum_volume:
+        # 누적거래량 차이로 이번 틱의 체결량을 복원(필드 15 가 비어 오는 경우 대비).
+        # 기준선이 아직 없으면 차분을 쓰지 않는다 — 하루치 누적이 한 봉에 몰린다.
+        if not tick_volume and cum_volume and self._cum_volume_seeded:
             tick_volume = max(cum_volume - self._last_cum_volume, 0)
         if cum_volume:
             self._last_cum_volume = cum_volume
+            self._cum_volume_seeded = True
 
         slot = floor_minute(ts, self.interval)
         closed: Bar | None = None

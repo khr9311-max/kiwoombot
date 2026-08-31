@@ -122,7 +122,38 @@ class TestBarAggregation:
         closed = s.on_tick(base + timedelta(minutes=1), 103.0, cum_volume=60)
         assert closed is not None
         assert (closed.open, closed.high, closed.low, closed.close) == (100.0, 105.0, 98.0, 102.0)
-        assert closed.volume == 40  # 누적거래량 차이로 복원
+        # 첫 틱은 기준선을 잡기만 하고(체결량 0), 이후 3틱의 차분 10+10+10 만 쌓인다.
+        assert closed.volume == 30
+
+    def test_first_tick_does_not_dump_whole_day_volume_into_one_bar(self):
+        """
+        장중에 구독을 시작하면 첫 틱의 누적거래량은 '그날 전체'다.
+        기준선 없이 차분을 계산하면 하루치가 한 봉에 통째로 들어간다.
+        """
+        s = BarSeries("005930")
+        base = datetime(2026, 8, 27, 13, 0)
+        s.on_tick(base, 70_000, cum_volume=1_500_000)          # 하루치 누적
+        s.on_tick(base + timedelta(seconds=30), 70_100, cum_volume=1_500_500)
+        closed = s.on_tick(base + timedelta(minutes=1), 70_200, cum_volume=1_501_000)
+
+        assert closed is not None
+        assert closed.volume == 500        # 1,500,000 이 아니라 실제 증분만
+        assert closed.volume < 10_000
+
+    def test_warmup_without_cumulative_volume_still_seeds_safely(self):
+        """ka10080 응답 스펙에는 누적거래량이 없다. 없어도 첫 봉이 오염되면 안 된다."""
+        s = BarSeries("005930")
+        base = datetime(2026, 8, 27, 9, 0)
+        s.warmup([
+            {"time": base + timedelta(minutes=i), "open": 100.0, "high": 101.0,
+             "low": 99.0, "close": 100.0, "volume": 10}      # cum_volume 키 자체가 없음
+            for i in range(30)
+        ])
+        s.on_tick(base + timedelta(minutes=30), 110.0, cum_volume=2_000_000)
+        closed = s.on_tick(base + timedelta(minutes=31), 111.0, cum_volume=2_000_300)
+        assert closed is not None
+        assert closed.volume == 0          # 기준선을 잡는 봉이라 증분 없음
+        assert s.to_frame()["volume"].max() < 10_000
 
     def test_warmup_then_live_ticks(self):
         s = BarSeries("005930")

@@ -9,12 +9,20 @@
       upName      : 업종명, ETF 는 "" 로 온다
   - pykrx: 일봉 시세 / 시가총액 (거래대금·이동평균·거래량 급증 판정)
 
+data.krx.co.kr 은 비로그인 조회를 차단하므로(응답 400 "LOGOUT") pykrx 를 쓰려면
+KRX_ID / KRX_PW 환경 변수가 반드시 있어야 한다. 없으면 pykrx 는 예외 대신 빈
+DataFrame 을 돌려주고 안내문을 stdout 으로만 print 하기 때문에, 아래에서 stdout 을
+가로채 로그로 남기고 원인을 ScreenerError 로 올려 텔레그램 알림까지 전달한다.
+
 pykrx 는 날짜별 횡단면 조회가 종목별 조회보다 훨씬 빠르므로, 최근 N영업일 패널을
 data/daily_panel.pkl 에 캐시해 두고 매일 없는 날짜만 증분으로 받아온다.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
+import os
 import pickle
 import time
 from dataclasses import dataclass
@@ -35,6 +43,35 @@ MARKET_CODES = {"KOSPI": "0", "KOSDAQ": "10"}
 
 PANEL_PATH = cfg.DATA_DIR / "daily_panel.pkl"
 UNIVERSE_PATH = cfg.DATA_DIR / "universe.json"
+
+KRX_LOGIN_HINT = (
+    "data.krx.co.kr 은 로그인 없는 시세 조회를 차단합니다. "
+    "data.krx.co.kr 에서 무료 회원가입한 뒤 .env 에 KRX_ID / KRX_PW 를 넣으세요"
+)
+
+
+class ScreenerError(RuntimeError):
+    """스크리닝을 진행할 수 없는 상태(데이터 소스 장애·인증 누락 등)."""
+
+
+def krx_login_ready() -> bool:
+    """pykrx 가 KRX 로그인에 쓰는 환경 변수가 채워져 있는지."""
+    return bool(os.getenv("KRX_ID", "").strip() and os.getenv("KRX_PW", "").strip())
+
+
+def _pykrx(fn, *args, **kwargs):
+    """
+    pykrx 호출 래퍼. pykrx 는 로그인 실패·JSON 파싱 실패를 예외가 아니라 stdout
+    print 로 알리므로, 그대로 두면 원인이 로그 어디에도 남지 않는다.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*args, **kwargs)
+    for line in buf.getvalue().splitlines():
+        line = line.strip()
+        if line:
+            log.warning("pykrx: %s", line)
+    return result
 
 
 @dataclass
@@ -175,15 +212,24 @@ def build_panel(lookback_days: int = 90, markets: tuple[str, ...] = cfg.UNIVERSE
     have = set(panel["date"].unique()) if not panel.empty else set()
     missing = [d for d in wanted if d not in have]
 
+    # 공휴일은 캐시에 영원히 안 채워지므로 missing 에 남는다. 따라서 "덜 받아온 것"
+    # 자체는 정상이고, 조회가 예외로 터진 횟수만 장애 신호로 센다.
+    if missing and not krx_login_ready():
+        raise ScreenerError(f"KRX 계정(KRX_ID/KRX_PW)이 설정되지 않았습니다 — {KRX_LOGIN_HINT}")
+
     if missing:
         log.info("일봉 패널 증분 수집: %d일 (%s ~ %s)", len(missing), missing[0], missing[-1])
     new_frames: list[pd.DataFrame] = []
+    errors = 0
+    last_error = ""
     for day in missing:
         for market in markets:
             try:
-                df = stock.get_market_ohlcv(day, market=market.upper())
+                df = _pykrx(stock.get_market_ohlcv, day, market=market.upper())
             except Exception as exc:
                 log.warning("pykrx %s %s 조회 실패: %s", day, market, exc)
+                errors += 1
+                last_error = str(exc)
                 continue
             if df is None or df.empty or df["거래량"].sum() == 0:
                 continue  # 휴장일
@@ -198,6 +244,14 @@ def build_panel(lookback_days: int = 90, markets: tuple[str, ...] = cfg.UNIVERSE
             )
             new_frames.append(part.reset_index(drop=True))
             time.sleep(0.2)  # KRX 서버 배려
+
+    if errors and not new_frames:
+        raise ScreenerError(
+            f"pykrx 일봉 조회가 {errors}건 모두 실패했습니다 (마지막 오류: {last_error}). "
+            f"KRX 계정이 막혔거나 비밀번호가 바뀌었을 수 있습니다 — {KRX_LOGIN_HINT}"
+        )
+    if errors:
+        log.warning("일봉 조회 일부 실패: %d건 (마지막 오류: %s)", errors, last_error)
 
     if new_frames:
         panel = pd.concat([panel, *new_frames], ignore_index=True)
@@ -218,7 +272,7 @@ def fetch_market_cap(markets: tuple[str, ...] = cfg.UNIVERSE_MARKETS) -> pd.Seri
         frames = []
         for market in markets:
             try:
-                df = stock.get_market_cap(day, market=market.upper())
+                df = _pykrx(stock.get_market_cap, day, market=market.upper())
             except Exception as exc:
                 log.warning("pykrx 시가총액 %s %s 실패: %s", day, market, exc)
                 continue
@@ -242,13 +296,11 @@ def screen(client: KiwoomClient, top_n: int = cfg.UNIVERSE_MAX) -> list[Candidat
 
     master = filter_tradable(fetch_master(client))
     if master.empty:
-        log.error("종목 마스터가 비어 있습니다")
-        return []
+        raise ScreenerError("종목 마스터가 비어 있습니다 (키움 ka10099 응답 확인)")
 
     panel = build_panel(lookback_days=max(cfg.MA_TREND_PERIOD + 20, 90))
     if panel.empty:
-        log.error("일봉 패널이 비어 있습니다")
-        return []
+        raise ScreenerError(f"일봉 패널이 비어 있습니다 — {KRX_LOGIN_HINT}")
 
     panel = panel[panel["code"].isin(set(master["code"]))]
     wide_close = panel.pivot(index="date", columns="code", values="close").sort_index()
@@ -256,8 +308,10 @@ def screen(client: KiwoomClient, top_n: int = cfg.UNIVERSE_MAX) -> list[Candidat
     wide_val = panel.pivot(index="date", columns="code", values="value").sort_index()
 
     if len(wide_close) < cfg.MA_TREND_PERIOD:
-        log.error("일봉 이력 부족: %d일 < %d일", len(wide_close), cfg.MA_TREND_PERIOD)
-        return []
+        raise ScreenerError(
+            f"일봉 이력 부족: {len(wide_close)}일 < {cfg.MA_TREND_PERIOD}일 "
+            "(MA_TREND_PERIOD 를 줄이거나 패널이 채워질 때까지 기다리세요)"
+        )
 
     last_close = wide_close.iloc[-1]
     ma_trend = wide_close.tail(cfg.MA_TREND_PERIOD).mean()

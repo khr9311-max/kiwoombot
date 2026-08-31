@@ -75,6 +75,7 @@ class TradingBot:
         self.executor = OrderExecutor(self.client, self.risk, self.db, self.notifier)
         self.ws = KiwoomWebSocket(
             token_provider=lambda: self.client.access_token,
+            token_refresher=lambda: self.client.issue_token(force=True),
             on_tick=self.on_tick,
             on_fill=self.executor.on_realtime_fill,
         )
@@ -99,6 +100,9 @@ class TradingBot:
         log.info("키움 자동매매 봇 기동 | %s", cfg.Summary().as_text())
         if cfg.DRY_RUN:
             log.warning("DRY-RUN 모드입니다. 주문 API 가 실제로 전송되지 않습니다.")
+        startup_warnings = cfg.warnings_()
+        for w in startup_warnings:
+            log.warning("설정 경고: %s", w)
         log.info("=" * 78)
 
         await asyncio.to_thread(self.client.issue_token)
@@ -109,6 +113,7 @@ class TradingBot:
             f"  환경: {cfg.KIWOOM_ENV}{' (DRY-RUN)' if cfg.DRY_RUN else ''}\n"
             f"  자산: {self.risk.total_equity:,.0f}원 / 주문가능 {self.risk.orderable_cash:,.0f}원\n"
             f"  보유: {len(self.risk.positions)}종목"
+            + "".join(f"\n⚠️ {w}" for w in startup_warnings)
         )
 
         self._tasks.append(asyncio.create_task(self.ws.run(), name="ws"))
@@ -165,10 +170,14 @@ class TradingBot:
         self.risk.reset_day(self.risk.total_equity)
         await self.sync_account(mark_day_start=True)
 
+        reason = ""
         try:
             candidates = await asyncio.to_thread(screener.screen, self.client, cfg.UNIVERSE_MAX)
+            if not candidates:
+                reason = "조건을 통과한 종목이 없습니다 (스크리닝 조건을 완화하세요)"
         except Exception as exc:
             log.exception("스크리닝 실패")
+            reason = str(exc)
             self.notifier.error(f"스크리닝 실패: {exc}\n이전 유니버스로 대체를 시도합니다")
             candidates = []
 
@@ -181,7 +190,10 @@ class TradingBot:
         else:
             self.universe = await asyncio.to_thread(screener.load_universe)
             if not self.universe:
-                self.notifier.error("감시 유니버스를 만들지 못했습니다 — 오늘은 신규 진입을 하지 않습니다")
+                self.notifier.error(
+                    "감시 유니버스를 만들지 못했습니다 — 오늘은 신규 진입을 하지 않습니다\n"
+                    f"원인: {reason or '알 수 없음 (로그를 확인하세요)'}"
+                )
 
         # 보유 종목은 반드시 감시해야 청산이 돈다.
         for code in self.risk.positions:

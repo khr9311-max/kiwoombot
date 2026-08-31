@@ -196,6 +196,24 @@ class OrderExecutor:
         with self._lock:
             po = self.pending.get(order_no)
 
+        # 919 거부사유가 실려 오면 그 주문은 죽은 주문이다. 즉시 정리해야
+        # 매수는 자리가 풀리고, 매도는 다시 시도할 수 있다.
+        reject_reason = (values.get("919") or "").strip()
+        if reject_reason:
+            self.stats.rejects += 1
+            self.stats.errors.append(f"{code} 주문거부: {reject_reason}")
+            self.db.update_order_status(order_no, f"거부: {reject_reason}")
+            log.error("주문 거부 %s %s(%s): %s", side, code, order_no, reject_reason)
+            self._finalize_cancel(order_no)
+            if side == "SELL":
+                self.notifier.error(
+                    f"매도 주문 거부 {name or code} — {reject_reason}\n"
+                    f"   포지션이 남아 있습니다. 수동 확인이 필요합니다."
+                )
+            else:
+                self.notifier.warn(f"매수 주문 거부 {name or code} — {reject_reason}")
+            return
+
         if fill_qty <= 0 or fill_price <= 0:
             # 접수/확인/취소 통보
             if po is not None:
