@@ -105,6 +105,7 @@ journalctl -u kiwoom-bot -f      # 실시간 로그, Ctrl+C로 종료
 
 - [ ] `--check` 통과
 - [ ] `--screen`으로 유니버스 확인
+
 - [ ] 모의투자 최소 2~4주 무중단 운용
 - [ ] 미체결·부분체결·취소가 로그/`--trades` 리포트와 일치하는지 확인
 - [ ] 킬스위치(`DAILY_LOSS_LIMIT_PCT`)를 낮게 잡아 실제 발동·청산 테스트
