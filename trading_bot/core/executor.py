@@ -186,7 +186,6 @@ class OrderExecutor:
         fill_qty = parse_int(values.get("911"))
         fill_price = parse_price(values.get("910"))
         remain = parse_int(values.get("902"))
-        side = "SELL" if str(values.get("907", "")).strip() == "1" else "BUY"
         fee = parse_price(values.get("938"))
         tax = parse_price(values.get("939"))
 
@@ -195,6 +194,11 @@ class OrderExecutor:
 
         with self._lock:
             po = self.pending.get(order_no)
+
+        # 매도/매수 구분은 우리가 주문을 낼 때 이미 확정한 po.side 를 최우선으로 쓴다.
+        # 907(매도수구분)이 비거나 예상 밖 값으로 오면 매도 체결이 매수로 오분류되어
+        # 유령 포지션이 생길 수 있다 — po 를 못 찾은 경우(추적 밖 주문)에만 907 로 판정한다.
+        side = po.side if po is not None else ("SELL" if str(values.get("907", "")).strip() == "1" else "BUY")
 
         # 919 거부사유가 실려 오면 그 주문은 죽은 주문이다. 즉시 정리해야
         # 매수는 자리가 풀리고, 매도는 다시 시도할 수 있다.
@@ -236,6 +240,8 @@ class OrderExecutor:
         reason = po.reason if po else ""
         self.db.log_fill(order_no=order_no, code=code, name=name, side=side, qty=qty,
                          price=price, fee=fee, tax=tax, reason=reason)
+        # cash 는 다음 30초 대사까지 지연되지 않도록 체결 즉시 반영한다(킬스위치 오발동 방지).
+        self.risk.apply_fill_cash(side, qty, price, fee, tax)
 
         if side == "BUY":
             self.stats.buy_fills += 1

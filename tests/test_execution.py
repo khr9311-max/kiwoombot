@@ -177,6 +177,42 @@ class TestSellFlow:
         assert risk.check_exit(risk.positions["005930"], 60_000) is None
         assert len(sells) == 1
 
+    def test_sell_fill_updates_cash_immediately_not_only_at_next_sync(self, rig):
+        """
+        cash 가 체결 시점이 아니라 다음 30초 대사까지 지연되면, 그 사이 킬스위치
+        판정이 매도금액을 통째로 못 본 것처럼 계산해 정상 익절에도 오발동한다.
+        """
+        client, risk, db, ex = rig
+        risk.cash = risk.orderable_cash = 7_000_000
+        risk.open_position("005930", 40, 75_000, name="삼성전자")  # 잔고상 300만 평가
+
+        po = ex.submit_exit(ExitOrder("005930", 40, "1차익절 +3.00%"), 77_250)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "SELL", 40, 77_250))
+
+        # 대사(sync) 없이도 매도대금(수수료 차감)이 즉시 cash 에 반영되어 있어야 한다.
+        # fill_msg 기본값: 938(수수료)=150, 939(세금)=0.
+        assert risk.cash == pytest.approx(7_000_000 + 40 * 77_250 - 150)
+        assert risk.mark_to_market({}) == pytest.approx(10_089_850)
+
+    def test_realtime_fill_side_trusts_pending_order_over_field_907(self, rig):
+        """
+        907(매도수구분) 이 비거나 예상 밖 값으로 와도, 우리가 이미 알고 있는
+        po.side(주문 시점에 확정된 방향)로 정확히 처리해야 한다 — 907 단독 의존은
+        매도 체결을 매수로 오분류해 유령 포지션을 만들 수 있다.
+        """
+        client, risk, db, ex = rig
+        risk.open_position("005930", 10, 70_000, name="삼성전자")
+        po = ex.submit_exit(ExitOrder("005930", 10, "손절 -2.00%"), 68_600)
+
+        msg = fill_msg(po.order_no, "005930", "SELL", 10, 68_600)
+        msg["907"] = ""  # 필드 누락/오염 상황을 흉내낸다
+
+        ex.on_realtime_fill(msg)
+
+        assert "005930" not in risk.positions   # 매도로 정상 처리되어 청산됨
+        assert ex.stats.sell_fills == 1
+        assert ex.stats.buy_fills == 0
+
 
 # ------------------------------------------------------------------ 미체결
 class TestUnfilledSweep:

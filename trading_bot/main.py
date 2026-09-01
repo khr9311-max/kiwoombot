@@ -87,6 +87,10 @@ class TradingBot:
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._last_sync = datetime.min
+        # Factor A 무응답 워치독: 세션 시작 후 한 번도 A 를 획득한 종목이 없으면 경보.
+        self._session_opened_at: datetime | None = None
+        self._factor_a_seen = False
+        self._factor_a_alerted = False
 
     # ================================================================ 기동
     async def start(self, run_now: bool = False) -> None:
@@ -184,8 +188,21 @@ class TradingBot:
             self.names = {c.code: c.name for c in candidates}
             # Factor A 판정에 쓸 전일 거래대금(스크리닝 패널의 20일 평균으로 근사)
             self.engine.set_prev_turnover({c.code: c.avg_value_20d for c in candidates})
+            display_items = [
+                {"code": c.code, "name": c.name, "avg_value_20d": c.avg_value_20d, "vol_surge": c.vol_surge}
+                for c in candidates
+            ]
         else:
-            self.universe = await asyncio.to_thread(screener.load_universe)
+            # 스크리닝 실패/공백 시 어제 저장분으로 대체한다. 코드만이 아니라
+            # avg_value_20d 도 함께 복원해야 Factor A(거래대금 유입) 판정이 살아난다 —
+            # 그렇지 않으면 하루 종일 로그도 없이 조용히 매매가 중단된다.
+            items = await asyncio.to_thread(screener.load_universe)
+            self.universe = [i["code"] for i in items]
+            self.names = {i["code"]: i.get("name", i["code"]) for i in items}
+            self.engine.set_prev_turnover({i["code"]: i.get("avg_value_20d", 0.0) for i in items})
+            display_items = items
+            if items:
+                log.info("스크리닝 실패 -> 이전 유니버스로 대체: %d종목", len(items))
             if not self.universe:
                 self.notifier.error(
                     "감시 유니버스를 만들지 못했습니다 — 오늘은 신규 진입을 하지 않습니다\n"
@@ -201,9 +218,10 @@ class TradingBot:
             return
 
         lines = "\n".join(
-            f"  {i+1:2d}. {c.name}({c.code})  거래대금 {c.avg_value_20d/1e8:,.0f}억  "
-            f"거래량급증 {c.vol_surge:.2f}x"
-            for i, c in enumerate(candidates[:15])
+            f"  {i+1:2d}. {it.get('name', it['code'])}({it['code']})  "
+            f"거래대금 {it.get('avg_value_20d', 0.0)/1e8:,.0f}억  "
+            f"거래량급증 {it.get('vol_surge', 0.0):.2f}x"
+            for i, it in enumerate(display_items[:15])
         )
         self.notifier.info(f"🔎 감시 유니버스 {len(self.universe)}종목\n{lines}")
 
@@ -233,6 +251,9 @@ class TradingBot:
             await self.morning_job()
         self.session_active = True
         self.risk.halt_new_entry = False
+        self._session_opened_at = datetime.now()
+        self._factor_a_seen = False
+        self._factor_a_alerted = False
         await self.sync_account(mark_day_start=self.risk.day_start_equity <= 0)
         log.info("=== 장중 세션 시작 ===")
         self.notifier.info(f"▶️ 장중 세션 시작 — 감시 {len(self.universe)}종목")
@@ -255,13 +276,12 @@ class TradingBot:
         except ValueError:
             ts = datetime.now()
 
-        # 키움 실시간 WebSocket의 14번 필드(누적거래대금)는 '백만원' 단위로 수신됨 -> 원 단위로 환산(* 1_000_000).
-        # 단, 모의/테스트 환경에서 이미 원 단위(>=1억)로 들어오는 경우 이중 곱셈 방지.
-        raw_to = parse_price(values.get("14"))
-        if raw_to > 0:
-            cum_turnover = raw_to if raw_to >= 100_000_000 else raw_to * 1_000_000
-        else:
-            cum_turnover = 0.0
+        # 키움 실시간 WebSocket 0B 의 14번 필드(누적거래대금)는 공식 스펙상 예외 없이
+        # '백만원' 단위로 수신된다 -> 원 단위로 환산(* 1_000_000).
+        # (과거에 "이미 원 단위로 오면 이중 곱셈 방지"라는 크기 기반 휴리스틱이 있었으나,
+        #  스펙에 없는 조건이라 오히려 위험했다 — 진짜 원 단위 데이터가 들어오면 조용히
+        #  100만 배로 부풀려 Factor A 를 항상 통과시켜 버린다.)
+        cum_turnover = parse_price(values.get("14")) * 1_000_000
 
         series = self.bars.get(code)
         closed = series.on_tick(
@@ -285,6 +305,8 @@ class TradingBot:
         try:
             series = self.bars.get(code)
             sig = self.engine.evaluate(series)
+            if sig.factors.get("A_turnover", 0.0) > 0:
+                self._factor_a_seen = True
             if not sig.is_buy:
                 if sig.score >= 3.0:
                     name = self.names.get(code, code)
@@ -402,6 +424,31 @@ class TradingBot:
                 f"보유 종목 실시간 시세 5분 이상 끊김: {', '.join(held_stale)} — 재구독합니다"
             )
             asyncio.create_task(self.ws.subscribe(self.universe))
+        self._check_factor_a_health()
+
+    def _check_factor_a_health(self) -> None:
+        """
+        Factor A 무응답 워치독. SIGNAL_SCORE_THRESHOLD 가 Factor A 없이는 도달 불가능한
+        설계(기본값 기준 사실이다)이므로, 세션 시작 후 한참이 지나도 감시 유니버스
+        전체에서 A 를 한 번도 못 얻었다면 매매가 조용히 멈춰 있다는 신호다.
+        prev_turnover 기준선 유실, 단위 환산 회귀 등 이번에 실제로 있었던 장애를
+        당일 안에 잡기 위한 자체 무결성 점검.
+        """
+        if cfg.SIGNAL_SCORE_THRESHOLD <= cfg.FACTOR_MAX_SCORE_WITHOUT_A:
+            return  # 이 설정에선 A 없이도 진입 가능 -> 워치독 의미 없음
+        if (self._factor_a_alerted or self._factor_a_seen
+                or not self.universe or self._session_opened_at is None):
+            return
+        if datetime.now() - self._session_opened_at < timedelta(minutes=30):
+            return
+        self._factor_a_alerted = True
+        log.error("Factor A 무응답: 세션 시작 30분 경과, 감시 %d종목 중 A 획득 0건", len(self.universe))
+        self.notifier.error(
+            "⚠️ 세션 시작 30분이 지나도록 어떤 종목도 Factor A(거래대금 유입) 점수를 "
+            "얻지 못했습니다. 이 설정에서는 A 없이 매수 기준을 넘을 수 없어 매매가 조용히 "
+            "중단된 상태일 수 있습니다. prev_turnover 기준선(스크리닝/유니버스 폴백)과 "
+            "웹소켓 14번 필드 단위 환산을 확인하세요."
+        )
 
     async def sync_account(self, mark_day_start: bool = False) -> None:
         try:

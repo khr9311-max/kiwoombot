@@ -101,21 +101,21 @@ class SignalEngine:
         # --- Factor A: 당일 거래대금 유입
         prev_val = self.prev_turnover.get(code, 0.0)
         turnover_ratio = (snap.cum_turnover / prev_val) if prev_val > 0 else 0.0
-        factors["A_turnover"] = 2.0 if turnover_ratio >= cfg.FACTOR_A_TURNOVER_RATIO else 0.0
+        factors["A_turnover"] = cfg.FACTOR_A_WEIGHT if turnover_ratio >= cfg.FACTOR_A_TURNOVER_RATIO else 0.0
 
         # --- Factor B: 단기 이평 정배열 (직전 봉 골든크로스면 신선한 신호)
         ma_fast, ma_slow = float(last["ma_fast"]), float(last["ma_slow"])
         aligned = ma_fast > ma_slow
         crossed_now = aligned and float(prev["ma_fast"]) <= float(prev["ma_slow"])
-        factors["B_ma"] = 1.0 if aligned else 0.0
-        factors["B_cross"] = 0.5 if crossed_now else 0.0
+        factors["B_ma"] = cfg.FACTOR_B_MA_WEIGHT if aligned else 0.0
+        factors["B_cross"] = cfg.FACTOR_B_CROSS_WEIGHT if crossed_now else 0.0
 
         # --- Factor C: RSI 50 이상 우상향
         rsi_now, rsi_prev = float(last["rsi"]), float(prev["rsi"])
-        factors["C_rsi"] = 1.0 if (rsi_now >= 50.0 and rsi_now > rsi_prev) else 0.0
+        factors["C_rsi"] = cfg.FACTOR_C_WEIGHT if (rsi_now >= 50.0 and rsi_now > rsi_prev) else 0.0
 
         # --- Factor D: 체결강도
-        factors["D_strength"] = 1.0 if snap.strength >= cfg.FACTOR_D_STRENGTH else 0.0
+        factors["D_strength"] = cfg.FACTOR_D_WEIGHT if snap.strength >= cfg.FACTOR_D_STRENGTH else 0.0
 
         score = sum(factors.values())
 

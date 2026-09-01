@@ -108,6 +108,15 @@ ATR_PERIOD = _i("ATR_PERIOD", 14)
 FACTOR_A_TURNOVER_RATIO = _f("FACTOR_A_TURNOVER_RATIO", 0.30)
 # Factor D: 체결강도 임계치(%)
 FACTOR_D_STRENGTH = _f("FACTOR_D_STRENGTH", 110.0)
+
+# 팩터별 배점. strategy.SignalEngine.evaluate() 가 이 값을 그대로 가져다 쓴다 —
+# validate() 의 "Factor A 없이는 진입 불가능" 검증과 실제 채점 로직이 같은 값을
+# 보도록 여기 한 곳에서만 정의한다.
+FACTOR_A_WEIGHT = 2.0
+FACTOR_B_MA_WEIGHT = 1.0
+FACTOR_B_CROSS_WEIGHT = 0.5
+FACTOR_C_WEIGHT = 1.0
+FACTOR_D_WEIGHT = 1.0
 # 같은 종목 재진입 쿨다운(초)
 REENTRY_COOLDOWN_SEC = _i("REENTRY_COOLDOWN_SEC", 600)
 
@@ -216,3 +225,12 @@ def validate() -> list[str]:
     if SIZING_MODE not in ("fixed_pct", "atr_risk", "half_kelly"):
         errors.append(f"알 수 없는 SIZING_MODE: {SIZING_MODE}")
     return errors
+
+
+# Factor A(거래대금 유입) 없이 B+C+D 만으로 도달 가능한 최대점수.
+# SIGNAL_SCORE_THRESHOLD(기본 4.0)가 이보다 높다는 것은 설계상 Factor A가 사실상
+# 필수 조건이라는 뜻이다 — 그 자체는 의도된 전략이지만, 그래서 Factor A 판정 경로
+# (prev_turnover 기준선, 단위 환산 등)에 결함이 생기면 다른 팩터를 다 만족해도
+# 하루 종일 로그 한 줄 없이 조용히 매매가 중단된다(실제로 있었던 장애).
+# main.TradingBot 이 장중에 이 값을 근거로 "Factor A 무응답" 워치독을 돌린다.
+FACTOR_MAX_SCORE_WITHOUT_A = FACTOR_B_MA_WEIGHT + FACTOR_B_CROSS_WEIGHT + FACTOR_C_WEIGHT + FACTOR_D_WEIGHT

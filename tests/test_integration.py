@@ -60,6 +60,9 @@ def bot(tmp_path, monkeypatch):
     b._stop = asyncio.Event()
     b._tasks = []
     b._last_sync = datetime.min
+    b._session_opened_at = datetime.now()
+    b._factor_a_seen = False
+    b._factor_a_alerted = False
     return b
 
 
@@ -77,13 +80,15 @@ async def drain() -> None:
 
 
 def tick(price, hhmmss, cum_vol, cum_turnover, strength="115.0", high=None, low=None):
-    """0B 실시간 체결 메시지."""
+    """0B 실시간 체결 메시지. cum_turnover 는 '원' 단위로 받되, 필드 14 는 실제 키움
+    스펙대로 '백만원' 단위 문자열로 인코딩한다 — main.py 의 * 1_000_000 환산 경로를
+    테스트가 실제로 지나가도록(원 단위를 그대로 흘려보내던 예전 버그의 사각지대 방지)."""
     return {
         "20": hhmmss,
         "10": f"+{int(price)}",
         "15": "100",
         "13": str(cum_vol),
-        "14": str(int(cum_turnover)),
+        "14": str(int(cum_turnover) // 1_000_000),
         "16": "70000",
         "17": str(int(high or price)),
         "18": str(int(low or price)),
@@ -291,3 +296,51 @@ class TestFeedHealth:
         s.snapshot.updated = datetime.now() - timedelta(minutes=10)
         stale = bot.bars.stale_codes(datetime.now(), timedelta(minutes=5))
         assert "005930" in stale
+
+
+class TestFactorAWatchdog:
+    """
+    Factor A 무응답 워치독. SIGNAL_SCORE_THRESHOLD(기본 4.0) 는 Factor A 없이는
+    B+C+D 만으로 도달 불가능하게 설계돼 있다(3.5 < 4.0) — 이번 장애가 바로 이
+    경로였다: prev_turnover 유실/단위 환산 버그로 A 가 하루 종일 0점이었다.
+    """
+
+    def test_alerts_after_grace_period_when_no_symbol_ever_scored_factor_a(self, bot):
+        assert cfg.SIGNAL_SCORE_THRESHOLD > cfg.FACTOR_MAX_SCORE_WITHOUT_A
+        sent = []
+        bot.notifier.send = lambda text, level="INFO": sent.append((level, text)) or True
+
+        bot._session_opened_at = datetime.now() - timedelta(minutes=31)
+        bot._factor_a_seen = False
+        bot._factor_a_alerted = False
+
+        bot._check_factor_a_health()
+
+        assert bot._factor_a_alerted is True
+        assert any(lvl == "ERROR" for lvl, _ in sent)
+
+        # 한 번 경보한 뒤로는 반복 알림을 보내지 않는다.
+        sent.clear()
+        bot._check_factor_a_health()
+        assert sent == []
+
+    def test_no_alert_before_grace_period_elapses(self, bot):
+        sent = []
+        bot.notifier.send = lambda text, level="INFO": sent.append((level, text)) or True
+        bot._session_opened_at = datetime.now() - timedelta(minutes=5)
+
+        bot._check_factor_a_health()
+
+        assert bot._factor_a_alerted is False
+        assert sent == []
+
+    def test_no_alert_once_factor_a_has_been_seen(self, bot):
+        sent = []
+        bot.notifier.send = lambda text, level="INFO": sent.append((level, text)) or True
+        bot._session_opened_at = datetime.now() - timedelta(minutes=31)
+        bot._factor_a_seen = True
+
+        bot._check_factor_a_health()
+
+        assert bot._factor_a_alerted is False
+        assert sent == []

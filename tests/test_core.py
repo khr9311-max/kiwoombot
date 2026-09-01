@@ -376,6 +376,42 @@ class TestKillSwitch:
         # 시세가 없으면 평단으로 평가한다
         assert r.mark_to_market({}) == 5_000_000 + 1_000_000
 
+    def test_buy_fill_does_not_inflate_equity_before_next_sync(self, monkeypatch):
+        """
+        cash 는 30초 대사까지 그대로인데 포지션만 즉시 잡히면, 그 사이 mark_to_market
+        이 매수금액을 자산에 이중으로 계산해(cash 그대로 + 포지션 평가액) 자산이
+        과대계상된다 — apply_fill_cash 로 체결 즉시 cash 를 반영해야 한다.
+        """
+        monkeypatch.setattr(cfg, "DAILY_LOSS_LIMIT_PCT", -0.03)
+        r = _risk(10_000_000)
+
+        r.open_position("005930", 40, 75_000)  # 300만원 매수
+        r.apply_fill_cash("BUY", 40, 75_000)
+        r.mark_to_market({"005930": 75_000})
+
+        assert r.total_equity == pytest.approx(10_000_000)
+        assert r.check_kill_switch() is False
+
+    def test_sell_fill_does_not_crater_equity_before_next_sync(self, monkeypatch):
+        """
+        매도 체결 직후에도 cash 가 즉시 갱신되지 않으면 매도금액이 통째로 증발한
+        것처럼 계산돼, 정상적인 익절인데도 킬스위치가 오발동한다 — 실제로 있었던 장애.
+        """
+        monkeypatch.setattr(cfg, "DAILY_LOSS_LIMIT_PCT", -0.03)
+        r = _risk(10_000_000)
+        r.cash = 7_000_000
+        r.open_position("005930", 40, 75_000)
+        r.mark_to_market({"005930": 77_250})  # +3% 익절가
+        assert r.check_kill_switch() is False
+
+        r.reduce_position("005930", 40)
+        r.apply_fill_cash("SELL", 40, 77_250)
+        r.mark_to_market({})
+
+        assert r.total_equity == pytest.approx(10_090_000)  # 원금 + 익절 9만원
+        assert r.daily_pnl_pct() == pytest.approx(0.009, abs=1e-6)
+        assert r.check_kill_switch() is False
+
 
 class TestAccountSync:
     def test_restores_unknown_holdings_from_broker(self):

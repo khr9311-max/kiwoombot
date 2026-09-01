@@ -272,8 +272,14 @@ def save_universe(candidates: list[Candidate]) -> None:
     UNIVERSE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def load_universe(max_age_hours: int = 12) -> list[str]:
-    """오늘 만들어 둔 유니버스를 다시 읽는다(프로세스 재시작 복구용)."""
+def load_universe(max_age_hours: int = 12) -> list[dict]:
+    """
+    오늘 만들어 둔 유니버스를 다시 읽는다(프로세스 재시작·스크리닝 실패 복구용).
+
+    저장된 원본 항목(code/name/avg_value_20d 등)을 그대로 돌려준다 — 코드만 돌려주면
+    폴백 경로에서 Factor A 판정용 전일 거래대금(prev_turnover) 기준선을 잃어버려
+    거래대금 조건을 영원히 통과할 수 없게 된다(하루 종일 조용한 매매 중단).
+    """
     import json
 
     try:
@@ -287,4 +293,4 @@ def load_universe(max_age_hours: int = 12) -> list[str]:
     if (datetime.now() - gen) > timedelta(hours=max_age_hours):
         log.warning("저장된 유니버스가 오래됨(%s) — 무시", payload.get("generated_at"))
         return []
-    return [i["code"] for i in payload.get("items", [])]
+    return list(payload.get("items", []))

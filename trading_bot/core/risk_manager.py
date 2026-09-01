@@ -269,6 +269,19 @@ class RiskManager:
             return None
         return pos
 
+    def apply_fill_cash(self, side: str, qty: int, price: float, fee: float = 0.0, tax: float = 0.0) -> None:
+        """
+        체결 즉시 현금을 반영한다(다음 30초 대사에서 증권사 원장 값으로 재보정된다).
+
+        cash/positions 는 체결 시점에 즉시 갱신되는데 cash 만 다음 sync() 까지 지연되면,
+        1초 주기 킬스위치 판정(mark_to_market)이 매수 직후엔 자산을 과대계상하고
+        매도 직후엔 매도금액이 통째로 증발한 것처럼 계산해 정상 익절에도 오발동한다.
+        """
+        gross = qty * price
+        delta = -(gross + fee) if side == "BUY" else (gross - fee - tax)
+        self.cash += delta
+        self.orderable_cash += delta
+
     # ------------------------------------------------------------ 청산 판정
     def check_exit(self, pos: Position, price: float, now: datetime | None = None) -> ExitOrder | None:
         """보유 종목 하나에 대한 청산 판정. 우선순위: 손절 > 트레일링 > 익절 > 타임컷."""
