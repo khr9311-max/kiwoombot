@@ -164,6 +164,7 @@ class TradingBot:
 
         log.info("--- 장 전 스크리닝 시작 ---")
         self.risk.reset_day(self.risk.total_equity)
+        self.bars.reset_day()
         await self.sync_account(mark_day_start=True)
 
         reason = ""
@@ -254,13 +255,21 @@ class TradingBot:
         except ValueError:
             ts = datetime.now()
 
+        # 키움 실시간 WebSocket의 14번 필드(누적거래대금)는 '백만원' 단위로 수신됨 -> 원 단위로 환산(* 1_000_000).
+        # 단, 모의/테스트 환경에서 이미 원 단위(>=1억)로 들어오는 경우 이중 곱셈 방지.
+        raw_to = parse_price(values.get("14"))
+        if raw_to > 0:
+            cum_turnover = raw_to if raw_to >= 100_000_000 else raw_to * 1_000_000
+        else:
+            cum_turnover = 0.0
+
         series = self.bars.get(code)
         closed = series.on_tick(
             ts=ts,
             price=parse_price(values.get("10")),
             cum_volume=parse_int(values.get("13")),
             tick_volume=parse_int(values.get("15")),
-            cum_turnover=parse_price(values.get("14")),
+            cum_turnover=cum_turnover,
             strength=parse_price(values.get("228")),
             open_=parse_price(values.get("16")),
             high=parse_price(values.get("17")),
@@ -277,6 +286,11 @@ class TradingBot:
             series = self.bars.get(code)
             sig = self.engine.evaluate(series)
             if not sig.is_buy:
+                if sig.score >= 3.0:
+                    name = self.names.get(code, code)
+                    log.info("👀 시그널 근접 %s(%s) | %s", name, code, sig.reason)
+                else:
+                    log.debug("시그널 평가 %s: %s", code, sig.reason)
                 return
 
             # 아래로는 await 지점이 여러 개 있다. 같은 종목의 다음 봉이 그 사이에

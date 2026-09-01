@@ -179,6 +179,36 @@ class TestBarAggregation:
         assert len(s.to_frame(tail=10)) == 10
         assert list(s.to_frame(tail=10).index) == list(df.index[-10:])
 
+    def test_cum_turnover_fallback_and_authoritative_update(self):
+        """14번 필드 누락 시 tick_volume * price 폴백, 주어지면 직접 반영."""
+        s = BarSeries("005930")
+        base = datetime(2026, 8, 27, 9, 0)
+        # 1. 14번 필드 없이 틱 수신 -> 폴백 누적
+        s.on_tick(base, 10_000.0, cum_volume=100, tick_volume=100, cum_turnover=0.0)
+        assert s.snapshot.cum_turnover == 1_000_000.0  # 100 * 10,000
+
+        s.on_tick(base + timedelta(seconds=10), 10_000.0, cum_volume=150, tick_volume=50, cum_turnover=0.0)
+        assert s.snapshot.cum_turnover == 1_500_000.0  # + 50 * 10,000
+
+        # 2. 14번 필드(백만원 환산된 원 단위)가 주어지면 확정치로 업데이트
+        s.on_tick(base + timedelta(seconds=20), 10_000.0, cum_volume=200, tick_volume=50, cum_turnover=2_500_000.0)
+        assert s.snapshot.cum_turnover == 2_500_000.0
+
+    def test_bar_series_and_store_reset_day(self):
+        from trading_bot.core.bars import BarStore
+        store = BarStore()
+        s = store.get("005930")
+        base = datetime(2026, 8, 27, 9, 0)
+        s.on_tick(base, 10_000.0, cum_volume=100, tick_volume=100, cum_turnover=1_000_000.0, strength=120.0)
+        assert s.snapshot.cum_turnover == 1_000_000.0
+        assert s.snapshot.strength == 120.0
+
+        store.reset_day()
+        assert s.snapshot.cum_turnover == 0.0
+        assert s.snapshot.strength == 0.0
+        assert s.snapshot.cum_volume == 0
+
+
 
 # ============================================================ 리스크 관리
 def _risk(equity: float = 10_000_000) -> RiskManager:

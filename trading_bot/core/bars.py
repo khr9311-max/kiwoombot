@@ -99,6 +99,15 @@ class BarSeries:
                 self._cum_volume_seeded = True
                 self.snapshot.cum_volume = cum
 
+    def reset_day(self) -> None:
+        """새 거래일 시작 시 당일 상태 초기화."""
+        self._current = None
+        self._cum_volume_seeded = False
+        self._last_cum_volume = 0
+        self.snapshot.cum_turnover = 0.0
+        self.snapshot.cum_volume = 0
+        self.snapshot.strength = 0.0
+
     # ------------------------------------------------------------ 틱 반영
     def on_tick(
         self,
@@ -127,8 +136,6 @@ class BarSeries:
         s.updated = ts
         if cum_volume:
             s.cum_volume = cum_volume
-        if cum_turnover:
-            s.cum_turnover = cum_turnover
         if strength:
             s.strength = strength
         if open_:
@@ -149,6 +156,12 @@ class BarSeries:
         if cum_volume:
             self._last_cum_volume = cum_volume
             self._cum_volume_seeded = True
+
+        # 누적거래대금(14번 필드) 반영 및 누락 시 tick_volume * price 자체 누적 폴백
+        if cum_turnover > 0:
+            s.cum_turnover = cum_turnover
+        elif tick_volume > 0 and price > 0:
+            s.cum_turnover += tick_volume * price
 
         slot = floor_minute(ts, self.interval)
         closed: Bar | None = None
@@ -254,6 +267,12 @@ class BarStore:
             for c in list(self._series):
                 if c not in keep:
                     del self._series[c]
+
+    def reset_day(self) -> None:
+        """새 거래일 시작 시 모든 종목의 당일 상태 초기화."""
+        with self._lock:
+            for s in self._series.values():
+                s.reset_day()
 
     def stale_codes(self, now: datetime, max_age: timedelta) -> list[str]:
         """max_age 동안 틱이 없던 종목(시세 끊김 감지용)."""
