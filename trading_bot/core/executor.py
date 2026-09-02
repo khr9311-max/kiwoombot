@@ -1,7 +1,8 @@
 """
 [4단계] 주문 집행 및 사후 관리.
 
-  - 진입은 최우선지정가(trde_tp=7), 청산은 시장가(trde_tp=3) 가 기본.
+  - 진입은 ENTRY_ORDER_TYPE, 청산은 EXIT_ORDER_TYPE(시장가) 가 기본.
+    모의투자는 최유리/최우선지정가를 거부(RC4026)하므로 지정가로 자동 대체한다.
   - 슬리피지 가드: 시그널 발생가 대비 SLIPPAGE_GUARD_PCT 이상 뛰었으면 진입 포기.
   - 미체결 감시: UNFILLED_TIMEOUT_SEC 초 내 미체결이면 kt10003 으로 취소하고,
     UNFILLED_MAX_CHASE 회까지 현재가로 재시도.
@@ -75,12 +76,87 @@ class OrderExecutor:
         self._lock = threading.RLock()
         # 청산 시 진입 정보를 남겨두었다가 체결 시 trades 테이블에 기록
         self._exit_context: dict[str, dict] = {}
+        # 매매구분은 거부 응답을 보고 세션 중에 바꿀 수 있어야 하므로 인스턴스에 둔다.
+        self.entry_order_type = cfg.ENTRY_ORDER_TYPE
+        self.exit_order_type = cfg.EXIT_ORDER_TYPE
+        # 거부된 종목의 재시도 금지 시각 / 연속 거부 카운터 / 신규 진입 중단 사유
+        self._reject_until: dict[str, datetime] = {}
+        self._consecutive_rejects = 0
+        self.entry_halted_reason = ""
+
+    # ------------------------------------------------------------ 매매구분/거부
+    @staticmethod
+    def _price_arg(order_type: str, price: float) -> int | str:
+        """지정가 계열만 주문가를 싣는다. 시장가/최유리/최우선은 빈 값."""
+        return int(price) if order_type in cfg.LIMIT_ORDER_TYPES and price > 0 else ""
+
+    @staticmethod
+    def _is_order_type_reject(msg: str) -> bool:
+        """매매구분 자체가 환경에서 막힌 거부인지 (모의투자 RC4026 등)."""
+        return "RC4026" in msg or ("최유리" in msg and "불가" in msg)
+
+    def _fallback_order_type(self, order_type: str, msg: str) -> str:
+        """거부 사유가 매매구분 때문이면 대체 구분을, 아니면 빈 문자열을 준다."""
+        if not self._is_order_type_reject(msg):
+            return ""
+        alt = cfg.MOCK_UNSUPPORTED_ORDER_TYPES.get(order_type, "")
+        return alt if alt and alt != order_type else ""
+
+    def _record_error(self, msg: str) -> None:
+        """일일 리포트용 오류 목록. 같은 문구가 수백 번 쌓이지 않도록 중복은 접는다."""
+        if msg not in self.stats.errors:
+            self.stats.errors.append(msg)
+            del self.stats.errors[:-50]
+
+    def _on_buy_reject(self, code: str, name: str, msg: str) -> None:
+        """
+        매수 거부 뒤처리. 같은 종목을 봉마다 다시 던져 거부가 폭주하는 것을 막는다.
+          - 종목별 쿨다운
+          - 연속 거부가 임계치를 넘으면 신규 진입 중단(청산 감시는 계속)
+          - 알림은 임계치 전까지만, 중단 시 한 번 더
+        """
+        self.stats.rejects += 1
+        self._record_error(f"{code} 매수거부: {msg}")
+        self.risk.clear_pending_buy(code)
+
+        cooldown = max(cfg.ORDER_REJECT_COOLDOWN_SEC, 0)
+        self._reject_until[code] = datetime.now() + timedelta(seconds=cooldown)
+        self._consecutive_rejects += 1
+        log.error("매수 주문 거부 %s(%s): %s (연속 %d회, %d초 쿨다운)",
+                  name, code, msg, self._consecutive_rejects, cooldown)
+
+        if self._consecutive_rejects < cfg.MAX_CONSECUTIVE_REJECTS:
+            self.notifier.error(f"매수 주문 실패 {name}({code}): {msg}")
+        elif not self.entry_halted_reason:
+            self.entry_halted_reason = msg
+            self.notifier.error(
+                f"매수 거부 {self._consecutive_rejects}회 연속 — 신규 진입을 중단합니다.\n"
+                f"   마지막 사유: {msg}\n"
+                f"   보유 종목 청산 감시는 계속됩니다. 설정 확인 후 재기동하세요."
+            )
+
+    def resume_entries(self) -> None:
+        """설정을 고친 뒤 신규 진입을 다시 여는 수동 스위치."""
+        self.entry_halted_reason = ""
+        self._consecutive_rejects = 0
+        self._reject_until.clear()
 
     # ------------------------------------------------------------ 진입
     def submit_buy(self, code: str, name: str, qty: int, signal_price: float,
                    current_price: float, *, signal_id: int | None = None,
                    reason: str = "") -> PendingOrder | None:
         if qty <= 0:
+            return None
+
+        if self.entry_halted_reason:
+            log.info("신규 진입 중단 상태(%s) — %s 주문 생략", self.entry_halted_reason, code)
+            self.risk.clear_pending_buy(code)
+            return None
+
+        until = self._reject_until.get(code)
+        if until is not None and datetime.now() < until:
+            log.info("주문거부 쿨다운 %s (~%s) — 진입 생략", code, until.strftime("%H:%M:%S"))
+            self.risk.clear_pending_buy(code)
             return None
 
         # 슬리피지 가드 — 시그널 시점보다 이미 튄 종목은 쫓아가지 않는다.
@@ -92,19 +168,32 @@ class OrderExecutor:
                          code, signal_price, current_price, drift * 100)
                 return None
 
-        order_type = cfg.ENTRY_ORDER_TYPE
-        # 지정가 계열(0, 10, 20)만 가격을 실어 보낸다. 최우선/최유리/시장가는 빈 값.
-        price_arg = int(current_price) if order_type in ("0", "10", "20", "28") else ""
+        order_type = self.entry_order_type
+
+        def _buy(tp: str):
+            return self.client.buy(code, qty, self._price_arg(tp, current_price), trade_type=tp)
 
         try:
-            resp = self.client.buy(code, qty, price_arg, trade_type=order_type)
+            resp = _buy(order_type)
         except KiwoomAPIError as exc:
-            self.stats.rejects += 1
-            self.stats.errors.append(f"{code} 매수거부: {exc.msg}")
-            log.error("매수 주문 실패 %s: %s", code, exc)
-            self.notifier.error(f"매수 주문 실패 {name}({code}): {exc.msg}")
-            self.risk.clear_pending_buy(code)
-            return None
+            # 매매구분이 환경에서 막힌 거부(RC4026)면 대체 구분으로 한 번 더 시도하고,
+            # 이후 세션 내내 그 구분을 쓴다. 같은 거부를 매번 반복하지 않기 위함이다.
+            alt = self._fallback_order_type(order_type, exc.msg)
+            if not alt:
+                self._on_buy_reject(code, name, exc.msg)
+                return None
+            log.warning("진입 매매구분 %s 거부(%s) -> %s 로 대체", order_type, exc.msg, alt)
+            self.notifier.warn(f"진입 매매구분 {order_type} 거부 — {alt} 로 자동 전환합니다")
+            self.entry_order_type = order_type = alt
+            try:
+                resp = _buy(order_type)
+            except KiwoomAPIError as exc2:
+                self._on_buy_reject(code, name, exc2.msg)
+                return None
+
+        # 정상 접수 — 연속 거부 카운터와 이 종목의 쿨다운을 푼다.
+        self._consecutive_rejects = 0
+        self._reject_until.pop(code, None)
 
         order_no = str(resp.get("ord_no", "")).strip()
         po = PendingOrder(
@@ -136,18 +225,30 @@ class OrderExecutor:
         if qty <= 0:
             return None
 
-        order_type = cfg.EXIT_ORDER_TYPE if order.urgent else "0"
-        price_arg = int(price) if order_type in ("0", "10", "20", "28") else ""
+        order_type = self.exit_order_type if order.urgent else "0"
+
+        def _sell(tp: str):
+            return self.client.sell(order.code, qty, self._price_arg(tp, price), trade_type=tp)
 
         try:
-            resp = self.client.sell(order.code, qty, price_arg, trade_type=order_type)
+            resp = _sell(order_type)
         except KiwoomAPIError as exc:
-            self.stats.rejects += 1
-            self.stats.errors.append(f"{order.code} 매도거부: {exc.msg}")
-            log.error("매도 주문 실패 %s: %s", order.code, exc)
-            self.notifier.error(f"🚨 매도 주문 실패 {pos.name}({order.code}) {qty}주: {exc.msg}\n"
-                                f"   사유: {order.reason} — 수동 확인 필요")
-            return None
+            # 청산은 반드시 나가야 한다. 매매구분 거부면 대체 구분으로 즉시 재전송.
+            alt = self._fallback_order_type(order_type, exc.msg)
+            if alt:
+                log.warning("청산 매매구분 %s 거부(%s) -> %s 로 대체", order_type, exc.msg, alt)
+                self.exit_order_type = order_type = alt
+            try:
+                if not alt:
+                    raise exc
+                resp = _sell(order_type)
+            except KiwoomAPIError as exc2:
+                self.stats.rejects += 1
+                self._record_error(f"{order.code} 매도거부: {exc2.msg}")
+                log.error("매도 주문 실패 %s: %s", order.code, exc2)
+                self.notifier.error(f"🚨 매도 주문 실패 {pos.name}({order.code}) {qty}주: {exc2.msg}\n"
+                                    f"   사유: {order.reason} — 수동 확인 필요")
+                return None
 
         order_no = str(resp.get("ord_no", "")).strip()
         po = PendingOrder(
@@ -215,6 +316,8 @@ class OrderExecutor:
                     f"   포지션이 남아 있습니다. 수동 확인이 필요합니다."
                 )
             else:
+                self._reject_until[code] = datetime.now() + timedelta(
+                    seconds=max(cfg.ORDER_REJECT_COOLDOWN_SEC, 0))
                 self.notifier.warn(f"매수 주문 거부 {name or code} — {reject_reason}")
             return
 

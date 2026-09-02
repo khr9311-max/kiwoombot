@@ -587,3 +587,102 @@ class TestOrderRejection:
         assert risk.can_buy("005930", 70_000)[0] is True
         assert ex.stats.rejects == 1
         assert risk.positions == {}
+
+
+# ------------------------------------------------------------------ 매매구분
+_RC4026 = "[2000](RC4026:모의투자 최유리지정가와 최우선지정가 주문은 불가합니다.)"
+
+
+class RejectingClient(FakeClient):
+    """지정한 매매구분을 거부하는 대역 (모의투자 RC4026 재현)."""
+
+    def __init__(self, bad_types=("6", "7", "16", "26")):
+        super().__init__()
+        self.bad = set(bad_types)
+
+    def buy(self, code, qty, price="", trade_type="7", cond_price=""):
+        if trade_type in self.bad:
+            raise KiwoomAPIError("kt10000", 2000, _RC4026)
+        return super().buy(code, qty, price, trade_type, cond_price)
+
+    def sell(self, code, qty, price="", trade_type="3", cond_price=""):
+        if trade_type in self.bad:
+            raise KiwoomAPIError("kt10001", 2000, _RC4026)
+        return super().sell(code, qty, price, trade_type, cond_price)
+
+
+class TestOrderTypeFallback:
+    def test_mock_env_never_ships_unsupported_entry_type(self):
+        """모의투자에서 6/7/16/26 은 기동 시점에 대체되어 나가지 않아야 한다."""
+        assert cfg.IS_MOCK
+        assert cfg.ENTRY_ORDER_TYPE not in cfg.MOCK_UNSUPPORTED_ORDER_TYPES
+        assert cfg.EXIT_ORDER_TYPE not in cfg.MOCK_UNSUPPORTED_ORDER_TYPES
+
+    def test_rc4026_downgrades_and_retries_once(self, rig, monkeypatch):
+        client, risk, db, ex = rig
+        ex.client = client = RejectingClient()
+        ex.entry_order_type = "7"          # 설정이 잘못 들어온 상황을 가정
+
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        assert po is not None
+        assert client.sent[0][1]["tt"] == "0"      # 대체 구분으로 접수
+        assert client.sent[0][1]["price"] == 70_000  # 지정가는 가격을 실어야 한다
+        assert ex.entry_order_type == "0"          # 세션 내내 유지
+        assert ex.stats.rejects == 0
+
+        ex.submit_buy("000660", "SK하이닉스", 5, 70_000, 70_000)
+        assert client.sent[1][1]["tt"] == "0"      # 두 번째 주문은 거부 없이 바로
+
+    def test_exit_falls_back_so_position_still_closes(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 10, 70_000))
+
+        ex.client = client = RejectingClient()
+        ex.exit_order_type = "6"
+        assert ex.submit_exit(ExitOrder("005930", 10, "손절", urgent=True), 69_000) is not None
+        assert client.sent[0][0] == "SELL" and client.sent[0][1]["tt"] == "0"
+
+
+class TestRejectThrottle:
+    def test_same_code_is_not_retried_during_cooldown(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "ORDER_REJECT_COOLDOWN_SEC", 300)
+        client, risk, db, ex = rig
+        ex.client = FakeClient(fail_on={"buy"})
+
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000) is None
+        assert ex.stats.rejects == 1
+        # 다음 봉에서 같은 시그널이 또 떠도 API 를 두드리지 않는다
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000) is None
+        assert ex.stats.rejects == 1
+        assert ex.client.sent == []
+        assert risk.can_buy("005930", 70_000)[0] is True   # 슬롯은 풀려 있다
+
+    def test_consecutive_rejects_halt_new_entries(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "MAX_CONSECUTIVE_REJECTS", 3)
+        client, risk, db, ex = rig
+        ex.client = FakeClient(fail_on={"buy"})
+
+        for i, code in enumerate(("005930", "000660", "035720")):
+            assert ex.submit_buy(code, f"종목{i}", 10, 70_000, 70_000) is None
+        assert ex.entry_halted_reason
+        assert ex.stats.rejects == 3
+
+        # 중단 뒤로는 새 종목도 주문하지 않는다 (거부 카운트도 늘지 않는다)
+        assert ex.submit_buy("068270", "셀트리온", 10, 70_000, 70_000) is None
+        assert ex.stats.rejects == 3
+
+        # 청산은 계속 나가야 한다
+        ex.client = FakeClient()
+        ex.resume_entries()
+        assert ex.entry_halted_reason == ""
+        assert ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000) is not None
+
+    def test_error_list_folds_duplicates(self, rig):
+        client, risk, db, ex = rig
+        ex.client = FakeClient(fail_on={"buy"})
+        for _ in range(20):
+            ex._reject_until.clear()
+            ex.entry_halted_reason = ""
+            ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        assert len(ex.stats.errors) == 1

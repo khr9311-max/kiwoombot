@@ -304,6 +304,9 @@ docker run -d --name kiwoom-bot --restart unless-stopped \
 - 사용하는 API 11개의 경로 전부 일치
 - 응답 필드 60여 개 중 59개가 공식 스펙과 일치
 - 주문 본문(`dmst_stex_tp`/`stk_cd`/`ord_qty`/`trde_tp`/`ord_uv`/`cond_uv`)과 `trde_tp` 코드값 일치
+  - 단, **모의투자는 최유리(6/16/26)·최우선(7)·중간가(29/30/31) 지정가를 거부**한다(`RC4026`).
+    공식 스펙에는 없는 환경 제약이라 `settings.MOCK_UNSUPPORTED_ORDER_TYPES` 로 대체표를 두고,
+    기동 시 자동 치환 + 런타임 `RC4026` 수신 시 세션 매매구분을 낮춰 재전송한다.
 - 웹소켓 `LOGIN`/`PING`/`REG` 규약과 `0B`·`00` 필드번호 일치
 
 **대조로 찾아 고친 것**

@@ -104,6 +104,9 @@ class TradingBot:
         log.info("키움 자동매매 봇 기동 | %s", cfg.Summary().as_text())
         if cfg.DRY_RUN:
             log.warning("DRY-RUN 모드입니다. 주문 API 가 실제로 전송되지 않습니다.")
+        for note in cfg.ORDER_TYPE_NOTES:
+            log.warning("매매구분 자동 대체: %s", note)
+        log.info("주문 매매구분: 진입=%s 청산=%s", cfg.ENTRY_ORDER_TYPE, cfg.EXIT_ORDER_TYPE)
         log.info("=" * 78)
 
         await asyncio.to_thread(self.client.issue_token)

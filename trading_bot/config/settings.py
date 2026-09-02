@@ -154,13 +154,54 @@ KELLY_PAYOFF = _f("KELLY_PAYOFF", 1.5)
 KELLY_CAP = _f("KELLY_CAP", 0.20)                     # 켈리 결과 상한
 
 # ---------------------------------------------------------------- 주문 집행
-# trde_tp: 0=보통(지정가) 3=시장가 6=최유리지정가 7=최우선지정가
-#          10=보통(IOC) 13=시장가(IOC) 16=최유리(IOC) 20=보통(FOK)
-ENTRY_ORDER_TYPE = os.getenv("ENTRY_ORDER_TYPE", "7").strip()   # 최우선지정가
-EXIT_ORDER_TYPE = os.getenv("EXIT_ORDER_TYPE", "3").strip()     # 시장가 청산
+# trde_tp: 0=보통(지정가) 3=시장가 5=조건부지정가 6=최유리지정가 7=최우선지정가
+#          10=보통(IOC) 13=시장가(IOC) 16=최유리(IOC) 20=보통(FOK) 23=시장가(FOK)
+#          26=최유리(FOK) 28=스톱지정가 29=중간가 30=중간가(IOC) 31=중간가(FOK)
+
+# ord_uv(주문가)를 반드시 실어 보내야 하는 지정가 계열.
+# 시장가/최유리/최우선은 가격을 빈 문자열로 둔다.
+LIMIT_ORDER_TYPES = ("0", "5", "10", "20", "28")
+
+# 모의투자에서 거부되는 매매구분 -> 대체 구분.
+#   RC4026: "모의투자 최유리지정가와 최우선지정가 주문은 불가합니다."
+# 중간가(29/30/31)도 모의투자에서는 지원되지 않아 같이 묶어 둔다.
+MOCK_UNSUPPORTED_ORDER_TYPES = {
+    "6": "0",    # 최유리지정가 -> 보통(지정가)
+    "7": "0",    # 최우선지정가 -> 보통(지정가)
+    "16": "10",  # 최유리(IOC)  -> 보통(IOC)
+    "26": "20",  # 최유리(FOK)  -> 보통(FOK)
+    "29": "0",   # 중간가       -> 보통(지정가)
+    "30": "10",  # 중간가(IOC)  -> 보통(IOC)
+    "31": "20",  # 중간가(FOK)  -> 보통(FOK)
+}
+
+# 기동 시 대체된 내역. main 이 로그/알림으로 한 번 찍는다.
+ORDER_TYPE_NOTES: list[str] = []
+
+
+def _order_type(key: str, default: str) -> str:
+    """환경에 맞지 않는 매매구분은 기동 시점에 대체한다 (모의투자 RC4026 예방)."""
+    tp = os.getenv(key, default).strip()
+    if IS_MOCK and tp in MOCK_UNSUPPORTED_ORDER_TYPES:
+        alt = MOCK_UNSUPPORTED_ORDER_TYPES[tp]
+        ORDER_TYPE_NOTES.append(
+            f"{key}={tp} 는 모의투자에서 거부(RC4026)되므로 {alt} 로 대체합니다"
+        )
+        return alt
+    return tp
+
+
+# 모의투자 기본 진입은 지정가(0). 실계좌에서는 ENTRY_ORDER_TYPE=7 로 두면 최우선지정가.
+ENTRY_ORDER_TYPE = _order_type("ENTRY_ORDER_TYPE", "7")
+EXIT_ORDER_TYPE = _order_type("EXIT_ORDER_TYPE", "3")     # 시장가 청산
 UNFILLED_TIMEOUT_SEC = _i("UNFILLED_TIMEOUT_SEC", 30)
 UNFILLED_MAX_CHASE = _i("UNFILLED_MAX_CHASE", 1)     # 취소 후 재시도 횟수
 SLIPPAGE_GUARD_PCT = _f("SLIPPAGE_GUARD_PCT", 0.01)  # 시그널가 대비 1% 이상 뛰면 진입 포기
+
+# 주문이 거부된 종목은 일정 시간 다시 건드리지 않는다(같은 종목 반복 거부 방지).
+ORDER_REJECT_COOLDOWN_SEC = _i("ORDER_REJECT_COOLDOWN_SEC", 300)
+# 매수 거부가 연속으로 이만큼 나면 구조적 문제로 보고 신규 진입을 멈춘다.
+MAX_CONSECUTIVE_REJECTS = _i("MAX_CONSECUTIVE_REJECTS", 5)
 
 # ---------------------------------------------------------------- 알림/로그
 NOTIFIER = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | discord | null
