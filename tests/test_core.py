@@ -502,3 +502,57 @@ class TestTripleBarrier:
     def test_passthrough_filter_approves(self):
         d = PassThroughFilter().decide({"rsi": 60})
         assert d.approved and d.probability == 1.0
+
+
+# ============================================================ 학습 표본 선별
+class TestTrainSampleSelection:
+    """
+    거부 폭주가 있던 날은 같은 시그널이 봉마다 재발행돼 표본이 중복된다.
+    그대로 학습하면 그 종목·그 하루에 과적합된다.
+    """
+
+    @staticmethod
+    def _sig(code, ts, date="2026-09-03"):
+        return {"id": 0, "code": code, "ts": ts, "trade_date": date,
+                "features": {}, "label": 1}
+
+    def test_excluded_dates_are_dropped(self, monkeypatch):
+        from trading_bot.tools.train_meta import select_samples
+        monkeypatch.setattr(cfg, "TRAIN_EXCLUDE_DATES", ("2026-09-02",))
+        rows = [
+            self._sig("A", "2026-09-02T10:00:00", "2026-09-02"),
+            self._sig("A", "2026-09-03T10:00:00", "2026-09-03"),
+        ]
+        kept = select_samples(rows)
+        assert [r["trade_date"] for r in kept] == ["2026-09-03"]
+
+    def test_overlapping_signals_of_same_code_collapse(self, monkeypatch):
+        from trading_bot.tools.train_meta import select_samples
+        monkeypatch.setattr(cfg, "TRAIN_EXCLUDE_DATES", ())
+        monkeypatch.setattr(cfg, "TRAIN_DEDUPE_MIN", 60)
+        rows = [
+            self._sig("A", "2026-09-03T10:00:00"),
+            self._sig("A", "2026-09-03T10:01:00"),   # 보유 구간 안 — 같은 표본
+            self._sig("A", "2026-09-03T10:59:00"),   # 아직 안
+            self._sig("A", "2026-09-03T11:00:00"),   # 60분 경과 — 새 표본
+        ]
+        kept = select_samples(rows)
+        assert [r["ts"] for r in kept] == ["2026-09-03T10:00:00", "2026-09-03T11:00:00"]
+
+    def test_other_codes_are_independent(self, monkeypatch):
+        from trading_bot.tools.train_meta import select_samples
+        monkeypatch.setattr(cfg, "TRAIN_EXCLUDE_DATES", ())
+        monkeypatch.setattr(cfg, "TRAIN_DEDUPE_MIN", 60)
+        rows = [
+            self._sig("A", "2026-09-03T10:00:00"),
+            self._sig("B", "2026-09-03T10:00:30"),
+        ]
+        assert len(select_samples(rows)) == 2
+
+    def test_real_world_reject_storm_shape(self, monkeypatch):
+        """09-02 실측 형태: 한 종목이 1분마다 133번 뜬 경우 1건으로 접힌다."""
+        from trading_bot.tools.train_meta import select_samples
+        monkeypatch.setattr(cfg, "TRAIN_EXCLUDE_DATES", ())
+        monkeypatch.setattr(cfg, "TRAIN_DEDUPE_MIN", 60)
+        rows = [self._sig("086450", f"2026-09-03T10:{m:02d}:00") for m in range(0, 60)]
+        assert len(select_samples(rows)) == 1

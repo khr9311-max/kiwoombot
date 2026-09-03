@@ -64,6 +64,47 @@ def label_pending(db: Database) -> int:
     return labeled
 
 
+# ------------------------------------------------------------------ 표본 선별
+def select_samples(rows: list[dict]) -> list[dict]:
+    """
+    라벨된 시그널에서 학습에 쓸 표본만 고른다.
+
+    같은 종목의 시그널이 보유 구간(수직 장벽) 안에서 반복되면 사실상 같은 표본이라
+    표본 독립 가정이 깨진다. 거부 폭주가 있던 날은 이게 극단적으로 나타나(하루 917건
+    중 3종목이 40%) 그대로 학습하면 그 종목·그 하루에 과적합된 모델이 나온다.
+
+      1) TRAIN_EXCLUDE_DATES 에 든 날짜는 통째로 제외
+      2) 같은 종목에서 TRAIN_DEDUPE_MIN 분 안에 다시 뜬 시그널은 첫 건만 남김
+
+    Purged K-Fold 는 폴드 경계의 시간 누수를 막을 뿐 이런 중복은 걸러주지 않는다.
+    """
+    kept: list[dict] = []
+    last_kept: dict[str, datetime] = {}
+    dropped_date = dropped_dup = 0
+    window = timedelta(minutes=max(cfg.TRAIN_DEDUPE_MIN, 0))
+
+    for r in sorted(rows, key=lambda x: x["ts"]):
+        if r.get("trade_date") in cfg.TRAIN_EXCLUDE_DATES:
+            dropped_date += 1
+            continue
+        try:
+            ts = datetime.fromisoformat(r["ts"])
+        except (TypeError, ValueError):
+            kept.append(r)
+            continue
+        prev = last_kept.get(r["code"])
+        if prev is not None and ts - prev < window:
+            dropped_dup += 1
+            continue
+        last_kept[r["code"]] = ts
+        kept.append(r)
+
+    if dropped_date or dropped_dup:
+        log.info("표본 선별: %d건 -> %d건 (제외일 %d건, 중복 %d건 제거)",
+                 len(rows), len(kept), dropped_date, dropped_dup)
+    return kept
+
+
 # ------------------------------------------------------------------ 교차검증
 def purged_kfold_indices(n: int, n_splits: int = 5, embargo_pct: float = 0.02):
     """
@@ -107,7 +148,8 @@ def deflated_sharpe(sharpe: float, n_trials: int, n_obs: int,
 
 
 # ------------------------------------------------------------------ 학습
-def train(db: Database, min_samples: int = 300, dry: bool = False) -> dict | None:
+def train(db: Database, min_samples: int = 300, dry: bool = False,
+          force: bool = False) -> dict | None:
     try:
         import lightgbm as lgb
     except ImportError:
@@ -115,7 +157,7 @@ def train(db: Database, min_samples: int = 300, dry: bool = False) -> dict | Non
         return None
     from sklearn.metrics import roc_auc_score
 
-    rows = db.labeled_signals()
+    rows = select_samples(db.labeled_signals())
     if len(rows) < min_samples:
         log.error("학습 샘플 부족: %d < %d — 모의투자를 더 돌려 데이터를 모으세요",
                   len(rows), min_samples)
@@ -189,6 +231,12 @@ def train(db: Database, min_samples: int = 300, dry: bool = False) -> dict | Non
         log.info("--dry 지정 — 모델을 저장하지 않았습니다")
         return result
 
+    if mean_auc < cfg.META_MIN_CV_AUC and not force:
+        # 야간 재학습이 쓸만한 모델을 못 쓸 모델로 덮어쓰는 것을 막는다.
+        log.error("CV AUC %.3f < %.3f — 저장하지 않습니다 (--force 로 강제 저장)",
+                  mean_auc, cfg.META_MIN_CV_AUC)
+        return result
+
     with open(cfg.META_MODEL_PATH, "wb") as fh:
         pickle.dump(result, fh)
     log.info("모델 저장: %s", cfg.META_MODEL_PATH)
@@ -201,6 +249,10 @@ def main() -> None:
     parser.add_argument("--min-samples", type=int, default=300, help="최소 학습 샘플 수")
     parser.add_argument("--label-only", action="store_true", help="라벨링만 하고 종료")
     parser.add_argument("--dry", action="store_true", help="학습하되 저장하지 않음")
+    parser.add_argument("--force", action="store_true", help="CV AUC 미달이어도 저장")
+    parser.add_argument("--auto", action="store_true",
+                        help="타이머용: 라벨링 후 샘플이 충분할 때만 학습하고, "
+                             "부족해도 실패로 끝내지 않는다")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -208,7 +260,17 @@ def main() -> None:
     label_pending(db)
     if args.label_only:
         return
-    if train(db, args.min_samples, args.dry) is None:
+
+    if args.auto:
+        # 매일 도는 타이머라 데이터가 덜 모인 날은 조용히 넘어가야 한다.
+        n = len(select_samples(db.labeled_signals()))
+        if n < args.min_samples:
+            log.info("학습 보류: 유효 표본 %d < %d — 라벨링만 하고 종료", n, args.min_samples)
+            return
+        train(db, args.min_samples, args.dry, args.force)
+        return
+
+    if train(db, args.min_samples, args.dry, args.force) is None:
         sys.exit(1)
 
 

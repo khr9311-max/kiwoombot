@@ -1,0 +1,16 @@
+[Unit]
+Description=Kiwoom bot meta-labeling and model training
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kiwoom-bot
+Environment="PYTHONUNBUFFERED=1"
+Environment="TZ=Asia/Seoul"
+# --auto: 라벨링은 매일, 학습은 유효 표본이 --min-samples 이상 모인 날만.
+#         데이터가 덜 모여도 실패로 끝내지 않는다(타이머가 매일 붉게 뜨지 않도록).
+ExecStart=/home/ubuntu/kiwoom-bot/.venv/bin/python -m trading_bot.tools.train_meta --auto
+Nice=10

@@ -129,6 +129,19 @@ TB_UPPER_ATR_MULT = _f("TB_UPPER_ATR_MULT", 2.0)
 TB_LOWER_ATR_MULT = _f("TB_LOWER_ATR_MULT", 1.0)
 TB_VERTICAL_MIN = _i("TB_VERTICAL_MIN", 60)
 
+# 학습 표본 선별.
+#   TRAIN_EXCLUDE_DATES: 장애로 시그널이 중복 폭주한 날은 통째로 뺀다.
+#     2026-09-02 는 RC4026 거부 폭주로 같은 시그널이 봉마다 재발행돼
+#     917건 중 3종목이 40%를 차지한다(동국제약 133 / 가온전선 122 / 컴투스 117).
+#   TRAIN_DEDUPE_MIN: 같은 종목에서 이 분(分) 안에 다시 뜬 시그널은 한 건으로 본다.
+#     삼중 장벽의 보유 구간이 겹치면 사실상 같은 표본이라 독립 가정이 깨진다.
+TRAIN_EXCLUDE_DATES = tuple(
+    d.strip() for d in os.getenv("TRAIN_EXCLUDE_DATES", "2026-09-02").split(",") if d.strip()
+)
+TRAIN_DEDUPE_MIN = _i("TRAIN_DEDUPE_MIN", TB_VERTICAL_MIN)
+# 교차검증 AUC 가 이보다 낮은 모델은 저장하지 않는다(야간 재학습이 좋은 모델을 덮어쓰지 않도록).
+META_MIN_CV_AUC = _f("META_MIN_CV_AUC", 0.55)
+
 # ---------------------------------------------------------------- 리스크/자금
 POSITION_PCT = _f("POSITION_PCT", 0.10)               # 주문가능금액 대비 1회 진입 비중
 MAX_ORDER_AMOUNT = _f("MAX_ORDER_AMOUNT", 3_000_000)  # 1회 최대 주문금액

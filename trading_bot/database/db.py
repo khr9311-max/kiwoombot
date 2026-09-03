@@ -344,7 +344,8 @@ class Database:
     def labeled_signals(self) -> list[dict]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT id, code, ts, features, label FROM signals WHERE label IS NOT NULL"
+                "SELECT id, code, ts, trade_date, features, label "
+                "FROM signals WHERE label IS NOT NULL"
             ).fetchall()
         out = []
         for r in rows:

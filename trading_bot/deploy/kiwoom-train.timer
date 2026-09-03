@@ -1,0 +1,12 @@
+[Unit]
+Description=Run kiwoom meta-labeling/training after the close on trading days
+
+[Timer]
+# 장 마감(15:30) + 수직 장벽(60분) 이후. 시스템 TZ 가 Asia/Seoul 이어야 한다.
+OnCalendar=Mon-Fri 17:00:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=kiwoom-train.service
+
+[Install]
+WantedBy=timers.target
