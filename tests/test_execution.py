@@ -686,3 +686,78 @@ class TestRejectThrottle:
             ex.entry_halted_reason = ""
             ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
         assert len(ex.stats.errors) == 1
+
+
+# ------------------------------------------------------------------ 919 오판정
+class TestRejectReasonParsing:
+    """919 는 정상 통보에도 '0' 으로 실려 온다. 이걸 거부로 읽으면 전부 무너진다."""
+
+    def test_919_zero_is_not_a_rejection(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+
+        ack = fill_msg(po.order_no, "005930", "BUY", 0, 0, remain=10)
+        ack["913"], ack["910"], ack["911"], ack["919"] = "접수", "", "", "0"
+        ex.on_realtime_fill(ack)
+        assert ex.stats.rejects == 0
+        assert po.order_no in ex.pending
+
+        done = fill_msg(po.order_no, "005930", "BUY", 10, 70_000)
+        done["919"] = "0"
+        ex.on_realtime_fill(done)
+        assert ex.stats.rejects == 0
+        assert ex.stats.buy_fills == 1
+        assert risk.positions["005930"].qty == 10
+
+    def test_sell_ack_keeps_pending_exit_so_it_is_not_resent(self, rig):
+        """거부로 오판하면 pending_exit 이 풀려 같은 청산을 초 단위로 재전송한다."""
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 10, 70_000))
+
+        so = ex.submit_exit(ExitOrder("005930", 10, "손절", urgent=True), 69_000)
+        ack = fill_msg(so.order_no, "005930", "SELL", 0, 0, remain=10)
+        ack["913"], ack["910"], ack["911"], ack["919"] = "접수", "", "", "0"
+        ex.on_realtime_fill(ack)
+
+        assert ex.stats.rejects == 0
+        assert risk.positions["005930"].pending_exit == "손절"
+        assert risk.check_exit(risk.positions["005930"], 68_000) is None
+
+    def test_real_reject_code_still_detected(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        values = fill_msg(po.order_no, "005930", "BUY", 0, 0)
+        values["910"], values["911"], values["919"] = "0", "0", "800033"
+        ex.on_realtime_fill(values)
+        assert ex.stats.rejects == 1
+        assert ex.pending == {}
+
+    def test_status_reject_without_919(self, rig):
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        values = fill_msg(po.order_no, "005930", "BUY", 0, 0)
+        values["910"], values["911"], values["913"], values["919"] = "0", "0", "거부", "0"
+        ex.on_realtime_fill(values)
+        assert ex.stats.rejects == 1
+        assert ex.pending == {}
+
+
+class TestExitRejectCooldown:
+    def test_rejected_exit_waits_before_resending(self, rig, monkeypatch):
+        monkeypatch.setattr(cfg, "EXIT_REJECT_COOLDOWN_SEC", 60)
+        client, risk, db, ex = rig
+        po = ex.submit_buy("005930", "삼성전자", 10, 70_000, 70_000)
+        ex.on_realtime_fill(fill_msg(po.order_no, "005930", "BUY", 10, 70_000))
+
+        ex.client = FakeClient(fail_on={"sell"})
+        assert ex.submit_exit(ExitOrder("005930", 10, "손절", urgent=True), 69_000) is None
+        assert ex.submit_exit(ExitOrder("005930", 10, "손절", urgent=True), 68_500) is None
+        assert ex.client.sent == []          # 쿨다운 동안 API 를 두드리지 않는다
+        assert ex.stats.rejects == 1
+
+        # 쿨다운이 지나면 다시 나가고, 접수되면 쿨다운은 풀린다.
+        ex._exit_reject_until["005930"] = datetime.now() - timedelta(seconds=1)
+        ex.client = FakeClient()
+        assert ex.submit_exit(ExitOrder("005930", 10, "손절", urgent=True), 68_000) is not None
+        assert "005930" not in ex._exit_reject_until

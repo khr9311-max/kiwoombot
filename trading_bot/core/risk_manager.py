@@ -81,7 +81,11 @@ class RiskManager:
         보유 중인데 내부에 없는 종목은 Position 으로 복원한다(평균단가/수량만 신뢰).
         """
         self.orderable_cash = deposit.get("ord_alow_amt") or deposit.get("entr", 0.0)
-        self.cash = deposit.get("entr", 0.0)
+        # 평가자산의 현금은 D+2 예수금으로 잡는다.
+        # entr(D+0 예수금)은 결제 전 기준이라 당일 매매 손익이 전혀 반영되지 않는다
+        # (모의투자에서 하루 종일 기준금액 그대로였다). 그걸 쓰면 total_equity 가
+        # 당일 손실을 못 보고, 킬스위치가 구조적으로 발동하지 않는다.
+        self.cash = deposit.get("d2_entra") or deposit.get("entr", 0.0)
         self.total_equity = self.cash + balance.get("total_eval", 0.0)
         if mark_day_start or self.day_start_equity <= 0:
             self.day_start_equity = self.total_equity

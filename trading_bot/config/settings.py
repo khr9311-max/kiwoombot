@@ -202,6 +202,9 @@ SLIPPAGE_GUARD_PCT = _f("SLIPPAGE_GUARD_PCT", 0.01)  # 시그널가 대비 1% �
 ORDER_REJECT_COOLDOWN_SEC = _i("ORDER_REJECT_COOLDOWN_SEC", 300)
 # 매수 거부가 연속으로 이만큼 나면 구조적 문제로 보고 신규 진입을 멈춘다.
 MAX_CONSECUTIVE_REJECTS = _i("MAX_CONSECUTIVE_REJECTS", 5)
+# 매도 거부는 포기할 수 없으니 재시도하되, 초 단위 재전송으로 주문가능수량을
+# 잠가버리지 않도록 이만큼 쉬었다가 다시 던진다.
+EXIT_REJECT_COOLDOWN_SEC = _i("EXIT_REJECT_COOLDOWN_SEC", 60)
 
 # ---------------------------------------------------------------- 알림/로그
 NOTIFIER = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | discord | null

@@ -442,6 +442,28 @@ class TestAccountSync:
         r.sync(deposit={"entr": 1_000_000}, balance={"total_eval": 0, "holdings": []})
         assert r.positions == {}
 
+    def test_equity_uses_d2_deposit_not_frozen_d0(self):
+        """
+        entr(D+0 예수금)은 결제 전 기준이라 당일 매매 손익이 반영되지 않는다.
+        (모의투자 실측: 하루 매매 후 entr=10,000,000 / d2_entra=9,597,142)
+        이걸 쓰면 손실이 자산에 안 잡혀 킬스위치가 영영 발동하지 않는다.
+        """
+        r = RiskManager()
+        r.sync(deposit={"entr": 10_000_000, "ord_alow_amt": 10_000_000},
+               balance={"total_eval": 0, "holdings": []}, mark_day_start=True)
+        r.sync(deposit={"entr": 10_000_000, "d2_entra": 9_597_142,
+                        "ord_alow_amt": 9_597_142},
+               balance={"total_eval": 0, "holdings": []})
+        assert r.cash == 9_597_142
+        assert r.daily_pnl_pct() == pytest.approx(-0.0403, abs=1e-4)
+        assert r.check_kill_switch() is True
+
+    def test_falls_back_to_entr_when_d2_missing(self):
+        r = RiskManager()
+        r.sync(deposit={"entr": 3_000_000, "ord_alow_amt": 3_000_000},
+               balance={"total_eval": 0, "holdings": []})
+        assert r.cash == 3_000_000
+
 
 # ============================================================ 메타 라벨링
 class TestTripleBarrier:

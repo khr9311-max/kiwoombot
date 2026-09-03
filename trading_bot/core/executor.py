@@ -81,6 +81,7 @@ class OrderExecutor:
         self.exit_order_type = cfg.EXIT_ORDER_TYPE
         # 거부된 종목의 재시도 금지 시각 / 연속 거부 카운터 / 신규 진입 중단 사유
         self._reject_until: dict[str, datetime] = {}
+        self._exit_reject_until: dict[str, datetime] = {}
         self._consecutive_rejects = 0
         self.entry_halted_reason = ""
 
@@ -89,6 +90,25 @@ class OrderExecutor:
     def _price_arg(order_type: str, price: float) -> int | str:
         """지정가 계열만 주문가를 싣는다. 시장가/최유리/최우선은 빈 값."""
         return int(price) if order_type in cfg.LIMIT_ORDER_TYPES and price > 0 else ""
+
+    @staticmethod
+    def _reject_reason(values: dict[str, str]) -> str:
+        """
+        실시간 주문체결(00)에서 '진짜' 거부 사유만 뽑아낸다.
+
+        919(거부사유)는 정상 접수/체결 통보에도 항상 실려 오고, 사유가 없을 때의
+        값이 빈 문자열이 아니라 "0" 이다(공식 스펙의 접수 예시도 '919':'0').
+        비어있는지만 보고 판정하면 모든 접수/체결 통보가 거부로 뒤집혀
+          - 매수는 체결을 못 받아 포지션이 안 잡히고
+          - 매도는 pending_exit 이 풀려 같은 청산을 초 단위로 재전송하다가
+            "모의투자 매도가능수량이 부족합니다"(800033) 를 맞는다.
+        913(주문상태)에 "거부"가 실려 오는 경우도 함께 본다.
+        """
+        raw = (values.get("919") or "").strip()
+        rejected = bool(raw) and raw.strip("0") != ""      # "", "0", "0000" 은 사유 없음
+        if not rejected and "거부" in (values.get("913") or ""):
+            rejected, raw = True, (raw if raw.strip("0") else (values.get("913") or "").strip())
+        return raw if rejected else ""
 
     @staticmethod
     def _is_order_type_reject(msg: str) -> bool:
@@ -225,11 +245,19 @@ class OrderExecutor:
         if qty <= 0:
             return None
 
+        # 직전 청산이 거부됐다면 잠시 쉰다. 초 단위로 다시 던지면 거래소에
+        # 살아있는 주문이 쌓여 매도가능수량을 스스로 잠근다(800033).
+        until = self._exit_reject_until.get(order.code)
+        if until is not None and datetime.now() < until:
+            log.info("매도 거부 쿨다운 %s (~%s) — 재전송 보류", order.code, until.strftime("%H:%M:%S"))
+            return None
+
         order_type = self.exit_order_type if order.urgent else "0"
 
         def _sell(tp: str):
             return self.client.sell(order.code, qty, self._price_arg(tp, price), trade_type=tp)
 
+        first_reject = order.code not in self._exit_reject_until
         try:
             resp = _sell(order_type)
         except KiwoomAPIError as exc:
@@ -245,11 +273,15 @@ class OrderExecutor:
             except KiwoomAPIError as exc2:
                 self.stats.rejects += 1
                 self._record_error(f"{order.code} 매도거부: {exc2.msg}")
-                log.error("매도 주문 실패 %s: %s", order.code, exc2)
-                self.notifier.error(f"🚨 매도 주문 실패 {pos.name}({order.code}) {qty}주: {exc2.msg}\n"
-                                    f"   사유: {order.reason} — 수동 확인 필요")
+                cooldown = max(cfg.EXIT_REJECT_COOLDOWN_SEC, 0)
+                self._exit_reject_until[order.code] = datetime.now() + timedelta(seconds=cooldown)
+                log.error("매도 주문 실패 %s: %s (%d초 뒤 재시도)", order.code, exc2, cooldown)
+                if first_reject:
+                    self.notifier.error(f"🚨 매도 주문 실패 {pos.name}({order.code}) {qty}주: {exc2.msg}\n"
+                                        f"   사유: {order.reason} — 수동 확인 필요")
                 return None
 
+        self._exit_reject_until.pop(order.code, None)
         order_no = str(resp.get("ord_no", "")).strip()
         po = PendingOrder(
             order_no=order_no, code=order.code, name=pos.name, side="SELL", qty=qty, remain=qty,
@@ -303,10 +335,10 @@ class OrderExecutor:
 
         # 919 거부사유가 실려 오면 그 주문은 죽은 주문이다. 즉시 정리해야
         # 매수는 자리가 풀리고, 매도는 다시 시도할 수 있다.
-        reject_reason = (values.get("919") or "").strip()
+        reject_reason = self._reject_reason(values)
         if reject_reason:
             self.stats.rejects += 1
-            self.stats.errors.append(f"{code} 주문거부: {reject_reason}")
+            self._record_error(f"{code} 주문거부: {reject_reason}")
             self.db.update_order_status(order_no, f"거부: {reject_reason}")
             log.error("주문 거부 %s %s(%s): %s", side, code, order_no, reject_reason)
             self._finalize_cancel(order_no)
