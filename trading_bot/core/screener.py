@@ -195,9 +195,13 @@ def screen(client: KiwoomClient, top_n: int = cfg.UNIVERSE_MAX) -> list[Candidat
     last_close = wide_close.iloc[-1]
     ma_trend = wide_close.tail(cfg.MA_TREND_PERIOD).mean()
     avg_val_20 = wide_val.tail(20).mean()
-    vol_5 = wide_vol.tail(5).mean()
-    vol_20 = wide_vol.tail(20).mean()
-    vol_surge = (vol_5 / vol_20.replace(0.0, pd.NA)).astype(float)
+    vol_5 = pd.to_numeric(wide_vol.tail(5).mean(), errors="coerce")
+    vol_20 = pd.to_numeric(wide_vol.tail(20).mean(), errors="coerce")
+    # 20일 평균 거래량이 0 인 무거래 종목은 급증비를 계산할 수 없으니 NaN 으로 둔다.
+    # 여기서 pd.NA 를 쓰면 Series 가 object dtype 이 되어 아래 astype(float) 이
+    # "float() argument must be a string or a real number, not 'NAType'" 로 터지고
+    # 스크리닝 전체가 실패한다 — float 를 유지하려면 NaN 이어야 한다.
+    vol_surge = (vol_5 / vol_20.replace(0.0, float("nan"))).astype(float)
     ret_5d = (wide_close.iloc[-1] / wide_close.iloc[-6] - 1.0) if len(wide_close) > 5 else last_close * 0
 
     # 시가총액 = 현재가 x 상장주식수 (ka10099 마스터에 이미 들어 있어 별도 조회가 필요 없다)
