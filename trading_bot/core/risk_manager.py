@@ -41,6 +41,7 @@ class Position:
     stop_price: float = 0.0            # ATR 기반 동적 손절가(0이면 % 손절 사용)
     pending_exit: str = ""             # 청산 주문 전송 후 체결 대기 중인 사유
     signal_id: int | None = None       # 매매일지-시그널 연결용
+    entry_fee_per_share: float = 0.0   # 진입 시 낸 수수료(가중평균, 주당) — 청산 손익에서 차감
 
     def unrealized_pct(self, price: float) -> float:
         if self.avg_price <= 0:
