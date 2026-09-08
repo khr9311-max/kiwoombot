@@ -234,9 +234,11 @@ class Database:
 
     def log_trade(self, *, code: str, name: str, entry_ts: str, exit_ts: str, qty: int,
                   entry_price: float, exit_price: float, exit_reason: str,
-                  signal_id: int | None = None) -> None:
-        pnl = (exit_price - entry_price) * qty
-        pnl_pct = (exit_price / entry_price - 1.0) if entry_price else 0.0
+                  signal_id: int | None = None, entry_fee: float = 0.0,
+                  exit_fee: float = 0.0, exit_tax: float = 0.0) -> None:
+        cost = entry_fee + exit_fee + exit_tax
+        pnl = (exit_price - entry_price) * qty - cost
+        pnl_pct = (pnl / (entry_price * qty)) if entry_price and qty else 0.0
         with self.connect() as conn:
             conn.execute(
                 """INSERT INTO trades

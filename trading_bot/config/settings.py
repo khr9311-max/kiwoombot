@@ -119,6 +119,11 @@ FACTOR_C_WEIGHT = 1.0
 FACTOR_D_WEIGHT = 1.0
 # 같은 종목 재진입 쿨다운(초)
 REENTRY_COOLDOWN_SEC = _i("REENTRY_COOLDOWN_SEC", 600)
+# 회전율 캡: 쿨다운은 속도만 늦추고 총량을 안 막아서 하루 같은 종목에 10회 넘게
+# 재진입 -> 손절 -> 재진입이 반복됐다(2026-09-08 JW신약 12회 전패 -70,634원 등).
+# 종목당/일일 총 진입 횟수를 못박아 손절이 반복되는 종목을 하루 안에서 포기시킨다.
+MAX_DAILY_ENTRIES_PER_SYMBOL = _i("MAX_DAILY_ENTRIES_PER_SYMBOL", 2)
+MAX_DAILY_ENTRIES_TOTAL = _i("MAX_DAILY_ENTRIES_TOTAL", 20)
 
 # ---------------------------------------------------------------- 메타 필터(ML 슬롯)
 META_FILTER_ENABLED = _b("META_FILTER_ENABLED", False)
@@ -218,6 +223,18 @@ MAX_CONSECUTIVE_REJECTS = _i("MAX_CONSECUTIVE_REJECTS", 5)
 # 매도 거부는 포기할 수 없으니 재시도하되, 초 단위 재전송으로 주문가능수량을
 # 잠가버리지 않도록 이만큼 쉬었다가 다시 던진다.
 EXIT_REJECT_COOLDOWN_SEC = _i("EXIT_REJECT_COOLDOWN_SEC", 60)
+
+# ---------------------------------------------------------------- 백테스트 비용 모델
+# 모의투자(mock)는 실계좌보다 훨씬 높은 수수료를 매긴다(실측: 매수/매도 각 0.35%,
+# 매도세 0.135% — 2026-09-08 fills 테이블 집계). 백테스트가 실계좌 요율로만 비용을
+# 계산하면 실행 환경(mock)의 실제 비용을 과소평가해 전략이 실제보다 좋아 보인다.
+# KIWOOM_ENV 에 맞춰 자동으로 골라 쓴다 — real 요율은 국내 통상 수준의 근사치다.
+FEE_RATE_MOCK = _f("FEE_RATE_MOCK", 0.0035)
+TAX_RATE_MOCK = _f("TAX_RATE_MOCK", 0.00135)
+FEE_RATE_REAL = _f("FEE_RATE_REAL", 0.00015)
+TAX_RATE_REAL = _f("TAX_RATE_REAL", 0.0018)
+FEE_RATE = FEE_RATE_MOCK if IS_MOCK else FEE_RATE_REAL
+TAX_RATE = TAX_RATE_MOCK if IS_MOCK else TAX_RATE_REAL
 
 # ---------------------------------------------------------------- 알림/로그
 NOTIFIER = os.getenv("NOTIFIER", "telegram").strip().lower()  # telegram | discord | null

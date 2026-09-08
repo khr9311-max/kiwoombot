@@ -74,6 +74,8 @@ class RiskManager:
         self.halt_new_entry: bool = False
         self._last_exit_time: dict[str, datetime] = {}
         self._pending_buys: dict[str, int] = {}   # 체결 대기 중인 매수 (중복 진입 방지)
+        self._entries_by_code: dict[str, int] = {}  # 회전율 캡: 종목별 당일 진입 횟수
+        self._daily_entries: int = 0                # 회전율 캡: 당일 총 진입 횟수
 
     # ------------------------------------------------------------ 계좌 동기화
     def sync(self, deposit: dict, balance: dict, *, mark_day_start: bool = False) -> None:
@@ -155,6 +157,8 @@ class RiskManager:
         self.day_start_equity = equity
         self._last_exit_time.clear()
         self._pending_buys.clear()
+        self._entries_by_code.clear()
+        self._daily_entries = 0
 
     # ------------------------------------------------------------ 진입 판정
     def can_buy(self, code: str, price: float, now: datetime | None = None) -> tuple[bool, str]:
@@ -176,6 +180,11 @@ class RiskManager:
         if last_exit and (now - last_exit).total_seconds() < cfg.REENTRY_COOLDOWN_SEC:
             remain = cfg.REENTRY_COOLDOWN_SEC - (now - last_exit).total_seconds()
             return False, f"재진입 쿨다운 {remain:.0f}초 남음"
+
+        if self._entries_by_code.get(code, 0) >= cfg.MAX_DAILY_ENTRIES_PER_SYMBOL:
+            return False, f"당일 재진입 한도 도달({cfg.MAX_DAILY_ENTRIES_PER_SYMBOL}회)"
+        if self._daily_entries >= cfg.MAX_DAILY_ENTRIES_TOTAL:
+            return False, f"당일 총 진입 한도 도달({cfg.MAX_DAILY_ENTRIES_TOTAL}회)"
 
         if price <= 0:
             return False, "가격 없음"
@@ -245,18 +254,22 @@ class RiskManager:
 
     def open_position(self, code: str, qty: int, price: float, *, name: str = "",
                       atr: float = 0.0, signal_id: int | None = None,
-                      now: datetime | None = None) -> Position:
+                      fee: float = 0.0, now: datetime | None = None) -> Position:
         now = now or datetime.now()
         self.clear_pending_buy(code)
         pos = self.positions.get(code)
         if pos and pos.qty > 0:
             total = pos.qty + qty
             pos.avg_price = (pos.avg_price * pos.qty + price * qty) / total
+            pos.entry_fee_per_share = (pos.entry_fee_per_share * pos.qty + fee) / total
             pos.qty = total
         else:
             pos = Position(code=code, name=name, qty=qty, avg_price=price,
-                           entry_time=now, peak_price=price, signal_id=signal_id)
+                           entry_time=now, peak_price=price, signal_id=signal_id,
+                           entry_fee_per_share=fee / qty if qty else 0.0)
             self.positions[code] = pos
+            self._entries_by_code[code] = self._entries_by_code.get(code, 0) + 1
+            self._daily_entries += 1
         if atr > 0:
             pos.stop_price = pos.avg_price - cfg.ATR_STOP_MULT * atr
         pos.peak_price = max(pos.peak_price, price)

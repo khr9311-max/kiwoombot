@@ -33,9 +33,11 @@ from ..core.strategy import SignalEngine
 
 log = logging.getLogger("backtest")
 
-# 국내주식 실거래 비용 근사: 매수 수수료, 매도 수수료 + 거래세
-FEE_RATE = 0.00015
-TAX_RATE = 0.0018
+# 매매 비용은 실행 환경(KIWOOM_ENV)에 맞춰 config.settings 가 고른 요율을 그대로 쓴다.
+# 모의투자는 실계좌보다 수수료가 훨씬 높아서(설정 파일 주석 참고), 실계좌 요율만
+# 쓰면 mock 실행 결과와 백테스트가 어긋난다.
+FEE_RATE = cfg.FEE_RATE
+TAX_RATE = cfg.TAX_RATE
 
 
 @dataclass

@@ -382,7 +382,7 @@ class OrderExecutor:
             self.stats.buy_fills += 1
             pos = self.risk.open_position(
                 code, qty, price, name=name,
-                signal_id=po.signal_id if po else None,
+                signal_id=po.signal_id if po else None, fee=fee,
             )
             if po and po.signal_id:
                 self.db.mark_signal_executed(po.signal_id)
@@ -394,6 +394,7 @@ class OrderExecutor:
                 ctx = self._exit_context.get(order_no, {})
             entry_price = ctx.get("entry_price", 0.0)
             pos_before = self.risk.positions.get(code)
+            entry_fee = (pos_before.entry_fee_per_share * qty) if pos_before else 0.0
             if pos_before and ctx.get("took_profit_partial"):
                 pos_before.took_profit = True
 
@@ -402,9 +403,13 @@ class OrderExecutor:
                 exit_ts=datetime.now().isoformat(timespec="seconds"), qty=qty,
                 entry_price=entry_price, exit_price=price, exit_reason=reason,
                 signal_id=ctx.get("signal_id"),
+                entry_fee=entry_fee, exit_fee=fee, exit_tax=tax,
             )
-            pnl_pct = (price / entry_price - 1.0) if entry_price else 0.0
-            pnl = (price - entry_price) * qty if entry_price else 0.0
+            # 수수료(매수+매도)와 매도세를 뺀 실현손익. apply_fill_cash 의 실제 현금
+            # 반영과 일치시켜 리포트의 "실현손익"이 계좌 평가금액 변동과 어긋나지 않게 한다.
+            cost = entry_fee + fee + tax
+            pnl = (price - entry_price) * qty - cost if entry_price else -cost
+            pnl_pct = (pnl / (entry_price * qty)) if entry_price and qty else 0.0
             self.risk.reduce_position(code, qty)
             self.notifier.trade(
                 fmt_fill("SELL", code, name or code, qty, price,
@@ -465,9 +470,16 @@ class OrderExecutor:
             self._finalize_cancel(po.order_no)
 
             if po.side == "SELL":
-                # 청산은 반드시 나가야 한다. 시장가로 즉시 재전송.
-                px = price_of(po.code) or po.price
-                self.submit_exit(ExitOrder(po.code, po.remain, f"{po.reason}(재전송)"), px)
+                # 취소가 거래소 원장에 반영되기 전에 곧바로 재전송하면 매도가능수량이
+                # 아직 안 풀려 800033(모의투자 매도가능수량 부족)을 스스로 유발한다
+                # (RC800033 관찰 메모: 2026-09-04~09-08 3일 연속 재현).
+                # 여기서 즉시 재전송하지 않고 거부 쿨다운과 같은 대기시간을 걸어두면,
+                # 1초 주기 exit_loop 의 check_exit 이 쿨다운이 풀린 뒤 자연스럽게
+                # submit_exit 을 다시 호출한다 — 종목당 청산 주문이 항상 하나만
+                # 살아있도록 직렬화된다.
+                cooldown = max(cfg.EXIT_REJECT_COOLDOWN_SEC, 0)
+                self._exit_reject_until[po.code] = datetime.now() + timedelta(seconds=cooldown)
+                log.info("매도 취소 %s -> %d초 뒤 재전송 (매도가능수량 반영 대기)", po.code, cooldown)
             elif po.chase_count < cfg.UNFILLED_MAX_CHASE:
                 px = price_of(po.code)
                 if not px:
