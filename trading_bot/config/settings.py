@@ -109,6 +109,19 @@ FACTOR_A_TURNOVER_RATIO = _f("FACTOR_A_TURNOVER_RATIO", 0.30)
 # Factor D: 체결강도 임계치(%)
 FACTOR_D_STRENGTH = _f("FACTOR_D_STRENGTH", 110.0)
 
+# 확장진입 차단(2026-09-11 실거래 487건 분석). 점수(A~D)는 전부 "얼마나 이미 올라왔는가"를
+# 점수화하는 모멘텀 팩터인데, 정작 실현손익과 median-split 해보면 RSI/당일고점근접도
+# (day_range_pos)/거래대금비율이 median 이상인 쪽이 median 미만인 쪽보다 오히려 총수익률이
+# 낮았다(각각 -0.24%/-0.14%/-0.05% vs +0.40%/+0.31%/+0.21%) — 초단기(중앙값 23분) 홀딩에서는
+# 이미 튄 종목을 사면 상투를 잡는 평균회귀 구간이라는 뜻. 세 조건을 모두 만족(=아직 안 튄
+# 상태)한 71건만 보면 비용 차감 후 거의 본전(-6,535원)까지 좁혀진다 — 나머지 416건이 손실의
+# 대부분을 만들었다. 점수 임계치를 올리는 것(SIGNAL_SCORE_THRESHOLD)은 이 분석과 반대
+# 방향이라 채택하지 않았다: score>=5 구간이 score=4 구간보다 오히려 총수익률이 더 나빴다.
+ENTRY_EXTENSION_GUARD = _b("ENTRY_EXTENSION_GUARD", True)
+MAX_ENTRY_DAY_RANGE_POS = _f("MAX_ENTRY_DAY_RANGE_POS", 0.60)   # 당일 저가~고가 구간에서 위치
+MAX_ENTRY_RSI = _f("MAX_ENTRY_RSI", 60.0)
+MAX_ENTRY_TURNOVER_RATIO = _f("MAX_ENTRY_TURNOVER_RATIO", 0.75)  # 전일 대비 당일 누적거래대금 비율
+
 # 팩터별 배점. strategy.SignalEngine.evaluate() 가 이 값을 그대로 가져다 쓴다 —
 # validate() 의 "Factor A 없이는 진입 불가능" 검증과 실제 채점 로직이 같은 값을
 # 보도록 여기 한 곳에서만 정의한다.
@@ -153,12 +166,22 @@ MAX_ORDER_AMOUNT = _f("MAX_ORDER_AMOUNT", 3_000_000)  # 1회 최대 주문금액
 MIN_ORDER_AMOUNT = _f("MIN_ORDER_AMOUNT", 100_000)    # 이보다 작으면 주문하지 않음
 MAX_POSITIONS = _i("MAX_POSITIONS", 5)
 
-STOP_LOSS_PCT = _f("STOP_LOSS_PCT", -0.02)           # -2.0%
+# 2026-09-04~11 실거래 517건 분석(승률 42.2% / 페이오프 0.83)에서 손절·익절의 손익
+# 비대칭이 기대값을 구조적으로 마이너스로 만들었다(손절은 전량 -2%, 1차익절은 절반만
+# +3%). 트레일링스탑(청산 후 잔량)의 평균 실현수익률(+4.02%)이 1차익절(+3.12%)보다
+# 높았으므로, 손절은 -1.5%로 좁히고 1차익절 비중은 줄여 더 많은 물량이 트레일링까지
+# 가도록 조정한다. 승률 42%·손절 -1.5%·트레일링 위주 구성 기준 손익비 손익분기는
+# 0.42/(1-0.42)≈0.72 — 기존 -2%/50% 구성의 손익분기 1.37보다 훨씬 낮다.
+STOP_LOSS_PCT = _f("STOP_LOSS_PCT", -0.015)          # -1.5% (기존 -2.0%)
 TAKE_PROFIT_PCT = _f("TAKE_PROFIT_PCT", 0.03)        # +3.0%
-TAKE_PROFIT_RATIO = _f("TAKE_PROFIT_RATIO", 0.5)     # 1차 익절 시 매도 비중
+TAKE_PROFIT_RATIO = _f("TAKE_PROFIT_RATIO", 0.35)    # 1차 익절 시 매도 비중 (기존 0.5)
 TRAILING_STOP_PCT = _f("TRAILING_STOP_PCT", -0.015)  # 최고점 대비 -1.5%
-TIME_CUT_MIN = _i("TIME_CUT_MIN", 60)                # 진입 후 N분 횡보 시 정리
-TIME_CUT_BAND_PCT = _f("TIME_CUT_BAND_PCT", 0.01)    # ±1% 이내면 '횡보'로 간주
+# 타임컷 150건을 실현손익 기준으로 보면 비용 차감 전 평균 수익률이 +0.02%(사실상 0)였고
+# 비용까지 반영하면 -394,677원으로 순손실 2위 사유였다(2026-09-11 분석). 정체된 포지션을
+# "본전 근처에서 강제로 잘라 비용만 문다"는 뜻이라 0으로 꺼서 손절/익절/트레일링/일괄청산
+# (15:15)에만 청산을 맡긴다.
+TIME_CUT_MIN = _i("TIME_CUT_MIN", 0)                 # 0 = 비활성 (기존 60분)
+TIME_CUT_BAND_PCT = _f("TIME_CUT_BAND_PCT", 0.01)    # ±1% 이내면 '횡보'로 간주 (TIME_CUT_MIN>0일 때만 사용)
 
 DAILY_LOSS_LIMIT_PCT = _f("DAILY_LOSS_LIMIT_PCT", -0.03)  # 킬스위치: 당일 -3%
 

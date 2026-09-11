@@ -118,18 +118,31 @@ class SignalEngine:
         factors["D_strength"] = cfg.FACTOR_D_WEIGHT if snap.strength >= cfg.FACTOR_D_STRENGTH else 0.0
 
         score = sum(factors.values())
+        features = self._features(df, snap, turnover_ratio)
 
         # 과열 차단: 볼린저 상단 돌파 + RSI 과매수 구간은 진입하지 않는다.
         bb_upper = float(last["bb_upper"]) if pd.notna(last["bb_upper"]) else float("inf")
         overbought = price > bb_upper and rsi_now >= 80.0
         if overbought:
-            return Signal(code, "NONE", score, price, now, factors, self._features(df, snap, turnover_ratio),
+            return Signal(code, "NONE", score, price, now, factors, features,
                           reason="과열(BB상단+RSI80)")
+
+        # 확장진입 차단 — 이미 많이 올라온 상태에서 사는 것을 막는다(설정 주석 참고).
+        if cfg.ENTRY_EXTENSION_GUARD:
+            extended = []
+            if features["day_range_pos"] >= cfg.MAX_ENTRY_DAY_RANGE_POS:
+                extended.append(f"day_range_pos={features['day_range_pos']:.2f}")
+            if rsi_now >= cfg.MAX_ENTRY_RSI:
+                extended.append(f"rsi={rsi_now:.1f}")
+            if turnover_ratio >= cfg.MAX_ENTRY_TURNOVER_RATIO:
+                extended.append(f"turnover_ratio={turnover_ratio:.2f}")
+            if extended:
+                return Signal(code, "NONE", score, price, now, factors, features,
+                              reason="확장진입차단(" + ",".join(extended) + ")")
 
         action = "BUY" if score >= cfg.SIGNAL_SCORE_THRESHOLD else "NONE"
         reason = f"score={score:.1f} " + " ".join(f"{k}={v:g}" for k, v in factors.items() if v)
-        return Signal(code, action, score, price, now, factors,
-                      self._features(df, snap, turnover_ratio), reason)
+        return Signal(code, action, score, price, now, factors, features, reason)
 
     # ------------------------------------------------------------ 피처
     @staticmethod

@@ -34,6 +34,11 @@ def bot(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "NO_NEW_ENTRY_AFTER", datetime(2026, 1, 1, 23, 59).time())
     monkeypatch.setattr(cfg, "FLATTEN_TIME", datetime(2026, 1, 1, 23, 58).time())
     monkeypatch.setattr(cfg, "SIGNAL_SCORE_THRESHOLD", 4.0)
+    # 이 파일의 시나리오는 의도적으로 강한 상승 추세(높은 RSI/당일고점근접도)를 만들어
+    # 배선(틱->시그널->주문)을 검증한다 — 확장진입 차단(ENTRY_EXTENSION_GUARD)의 대상이
+    # 되는 바로 그 패턴이므로, 파이프라인 테스트에서는 꺼서 차단 로직 자체(strategy 단위
+    # 테스트에서 별도 검증)와 배선 검증을 분리한다.
+    monkeypatch.setattr(cfg, "ENTRY_EXTENSION_GUARD", False)
 
     b = TradingBot.__new__(TradingBot)      # __init__ 의 네트워크 의존을 건너뛴다
     from trading_bot.core.bars import BarStore
@@ -136,6 +141,36 @@ class TestTickToOrderPipeline:
         pos = bot.risk.positions["005930"]
         assert pos.qty == po.qty
         assert bot.executor.pending == {}
+
+    def test_extension_guard_blocks_an_already_extended_uptrend(self, bot, monkeypatch):
+        """
+        확장진입 차단(ENTRY_EXTENSION_GUARD): 이 테스트만 별도로 켠다(fixture 는 배선
+        검증을 위해 기본 꺼둔다). 위와 같은 우상향이라도 RSI/당일고점근접도가 이미
+        차단 임계치를 넘긴 상태라면 점수 요건을 충족해도 매수 주문이 나가면 안 된다.
+        """
+        monkeypatch.setattr(cfg, "ENTRY_EXTENSION_GUARD", True)
+        bot.engine.set_prev_turnover({"005930": 1_000_000_000})
+
+        async def drive():
+            base = datetime(2026, 8, 27, 9, 0)
+            price = 70_000.0
+            cum_vol, cum_turn = 0, 0.0
+            for m in range(70):
+                # 위 테스트와 같은 패턴이지만 상승 강도를 키워 RSI/당일고점근접도를
+                # 확장진입 차단 임계치(RSI>=60, day_range_pos>=0.60) 위로 밀어 올린다.
+                price *= 1.004 if m % 5 else 0.9995
+                cum_vol += 5_000
+                cum_turn += 5_000 * price
+                bot.on_tick("005930", tick(price, (base + timedelta(minutes=m)).strftime("%H%M%S"),
+                                           cum_vol, cum_turn))
+                await drain()
+            await drain()
+
+        asyncio.run(drive())
+
+        buys = [s for s in bot.client.sent if s[0] == "BUY"]
+        assert not buys, "확장(상투) 구간인데도 매수 주문이 나갔습니다"
+        assert bot.risk.positions == {}
 
     def test_concurrent_signals_do_not_double_order(self, bot, monkeypatch):
         """
