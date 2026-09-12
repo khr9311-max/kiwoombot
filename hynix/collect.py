@@ -232,7 +232,18 @@ def backfill(kiwoom: bool = True, external: bool = True) -> None:
             time.sleep(FLOW_REQUEST_DELAY_SEC)
             collect_kr_flow(client, code)
             time.sleep(FLOW_REQUEST_DELAY_SEC)
-            # 수급 상세는 매매 대상에만 필요하다. 대조군까지 받으면 429 만 늘어난다.
+            # 수급 상세와 분봉은 매매 대상에만 필요하다. 대조군까지 받으면 429 만 늘어난다.
             if code == TARGET:
                 collect_kr_foreign(client, code)
                 time.sleep(FLOW_REQUEST_DELAY_SEC)
+                # 5분봉이 1년, 1분봉이 약 3개월 확보된다(연속조회 한계).
+                for tic, pages in ((5, 80), (1, 30)):
+                    collect_kr_min(client, code, tic=tic, max_pages=pages)
+                    time.sleep(FLOW_REQUEST_DELAY_SEC)
+
+    problems = store.validate()
+    if problems:
+        for p in problems:
+            log.warning("수집 데이터 검증 실패: %s", p)
+    else:
+        log.info("수집 데이터 검증 통과")
