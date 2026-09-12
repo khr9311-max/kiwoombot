@@ -28,9 +28,10 @@ import websockets
 
 from trading_bot.config import settings as cfg
 from trading_bot.core.kiwoom_client import KiwoomClient, parse_int, parse_price
+from trading_bot.core.notifier import build_notifier
 
 from . import store
-from .config import TARGET
+from .config import TARGET, TARGET_NAME
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +94,8 @@ class Recorder:
         self._last_quote_ms = 0.0
         self._stop = asyncio.Event()
         self.n_tick = self.n_quote = 0
+        self.n_reconnect = 0
+        self._notifier = build_notifier()
 
     # ------------------------------------------------------------ 적재
     @staticmethod
@@ -220,6 +223,7 @@ class Recorder:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    self.n_reconnect += 1
                     log.warning("WS 끊김(%s) -> %.0fs 후 재접속", exc, backoff)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 60.0)
@@ -229,6 +233,42 @@ class Recorder:
                 t.cancel()
             self._flush()
             log.info("기록 종료: 체결 %d건 / 호가 %d건", self.n_tick, self.n_quote)
+            self._report()
+
+    # ------------------------------------------------------------ 알림
+    def _report(self) -> None:
+        """하루치 수집 결과를 텔레그램으로 보낸다.
+
+        무인으로 도는 수집기라 조용히 실패하면 한 달치 데이터를 날리고도 모른다.
+        '오늘 몇 건 쌓였나' 한 줄이 그걸 막는 최소 장치다.
+        """
+        today = datetime.now().strftime("%Y%m%d")
+        try:
+            with store.connect() as con:
+                q = ("SELECT COUNT(*) FROM {} WHERE code=? AND substr(ts,1,8)=?")
+                ticks = con.execute(q.format("rt_tick"), (self.code, today)).fetchone()[0]
+                quotes = con.execute(q.format("rt_quote"), (self.code, today)).fetchone()[0]
+                exp = con.execute(
+                    "SELECT COUNT(*) FROM rt_quote WHERE code=? AND substr(ts,1,8)=?"
+                    " AND exp_px > 0", (self.code, today)).fetchone()[0]
+        except Exception as exc:
+            self._notifier.error(f"🔴 기록기 집계 실패 ({self.code}): {exc}")
+            return
+
+        head = f"{TARGET_NAME}({self.code}) 기록 종료"
+        body = (f"체결 {ticks:,}건 / 호가 {quotes:,}건\n"
+                f"동시호가 예상체결 {exp:,}건\n"
+                f"재접속 {self.n_reconnect}회")
+
+        if ticks == 0 and quotes == 0:
+            # 가장 중요한 실패 모드. 다만 주말이 아닌 임시휴장일(명절·대체공휴일 등)에도
+            # 똑같이 0건이 나온다 — 휴장일 달력이 없어 둘을 구분하지 못하니, 이 알림이
+            # 떴을 때 휴장일이었는지 먼저 확인할 것.
+            self._notifier.error(f"🔴 {head} — 수집 0건. 휴장일이 아니면 연결/구독 확인 필요\n{body}")
+        elif quotes == 0 or self.n_reconnect >= 10:
+            self._notifier.warn(f"🟡 {head} — 부분 이상\n{body}")
+        else:
+            self._notifier.info(f"🟢 {head}\n{body}")
 
 
 def _signed(value: Any) -> float:
