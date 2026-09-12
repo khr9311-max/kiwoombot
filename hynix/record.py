@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS rt_quote (
     bid_tot   INTEGER,          -- 매수호가총잔량
     net_bal   INTEGER,          -- 순매수잔량
     buy_ratio REAL,             -- 매수비율
+    exp_px    REAL,             -- 예상체결가 (동시호가 구간에서만 유효)
+    exp_qty   INTEGER,          -- 예상체결수량
     ask_px    TEXT,             -- 상위 DEPTH 호가 JSON 배열
     ask_qty   TEXT,
     bid_px    TEXT,
@@ -77,7 +79,10 @@ CREATE INDEX IF NOT EXISTS idx_rt_quote_day ON rt_quote(code, substr(ts,1,8));
 class Recorder:
     """0B/0D 를 받아 hynix.db 에 적재한다. 재접속·핑 응답까지 자체 처리."""
 
-    def __init__(self, code: str = TARGET, start_at: dtime = dtime(8, 50),
+    # 08:30 부터 받는 이유: 장전 동시호가 구간(08:30~09:00)에 0D 가 예상체결가(23)와
+    # 예상체결수량(24)을 실어 보낸다. 09:00 갭이 만들어지는 과정 그 자체라 갭 분석에
+    # 쓸 수 있는 유일한 사전 데이터다.
+    def __init__(self, code: str = TARGET, start_at: dtime = dtime(8, 30),
                  stop_at: dtime = dtime(15, 40)):
         self.code = code
         self.start_at = start_at
@@ -116,6 +121,7 @@ class Recorder:
             ask_px[0], bid_px[0],
             parse_int(v.get("121")), parse_int(v.get("125")),
             int(_signed(v.get("128"))), parse_price(v.get("129")),
+            parse_price(v.get("23")), parse_int(v.get("24")),
             json.dumps(ask_px), json.dumps(ask_qty),
             json.dumps(bid_px), json.dumps(bid_qty),
         ))
@@ -132,8 +138,8 @@ class Recorder:
             if self._quotes:
                 con.executemany(
                     "INSERT OR IGNORE INTO rt_quote (code,ts,hms,ask1,bid1,ask_tot,bid_tot,"
-                    "net_bal,buy_ratio,ask_px,ask_qty,bid_px,bid_qty)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", self._quotes)
+                    "net_bal,buy_ratio,exp_px,exp_qty,ask_px,ask_qty,bid_px,bid_qty)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", self._quotes)
                 self.n_quote += len(self._quotes)
         self._ticks.clear()
         self._quotes.clear()
@@ -196,6 +202,14 @@ class Recorder:
         store.init()
         with store.connect() as con:
             con.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS 는 이미 있는 테이블에 새 컬럼을 붙여주지
+            # 않는다. 스키마가 늘어난 채로 기존 DB 를 만나면 INSERT 가 통째로
+            # 실패하므로, 빠진 컬럼만 채워 넣는다.
+            have = {r[1] for r in con.execute("PRAGMA table_info(rt_quote)")}
+            for col, typ in (("exp_px", "REAL"), ("exp_qty", "INTEGER")):
+                if col not in have:
+                    con.execute(f"ALTER TABLE rt_quote ADD COLUMN {col} {typ}")
+                    log.info("rt_quote 에 %s 컬럼 추가", col)
         tasks = [asyncio.create_task(self._flusher()), asyncio.create_task(self._clock())]
         backoff = 1.0
         try:

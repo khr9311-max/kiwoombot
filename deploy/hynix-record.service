@@ -1,0 +1,30 @@
+[Unit]
+Description=SK하이닉스(000660) 실시간 체결/호가 기록기 — 매매 없음, 수집 전용
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/kiwoom-bot
+Environment="PYTHONUNBUFFERED=1"
+Environment="TZ=Asia/Seoul"
+ExecStart=/home/ubuntu/kiwoom-bot/.venv/bin/python -m hynix.record
+# 15:40 에 스스로 정상 종료(exit 0)하므로 재시작 대상이 아니다.
+# 장중에 죽은 경우에만 다시 띄운다.
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/kiwoom-bot/trading_bot/data /home/ubuntu/kiwoom-bot/trading_bot/logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hynix-record
+
+[Install]
+WantedBy=multi-user.target

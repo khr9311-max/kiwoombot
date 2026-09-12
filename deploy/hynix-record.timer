@@ -1,0 +1,13 @@
+[Unit]
+Description=평일 장전 동시호가 시작에 맞춰 기록기 기동
+
+[Timer]
+# 기록기 자체 가드가 08:30~15:40 이라 그보다 조금 뒤에 띄운다.
+# 08:30 정각에 띄우면 초 단위 오차로 가드에 걸려 즉시 종료될 수 있다.
+OnCalendar=Mon-Fri 08:31:00 Asia/Seoul
+# 꺼져 있던 동안 놓친 실행을 뒤늦게 따라잡지 않는다(장 끝난 뒤 기동 방지).
+Persistent=false
+Unit=hynix-record.service
+
+[Install]
+WantedBy=timers.target
